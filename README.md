@@ -15,7 +15,8 @@ A self-contained reference for diagnosing and optimising throughput across the I
 ├── scripts/
 │   ├── kafka-tcp-measure.sh             Measurement script (ping + iperf3)
 │   ├── kafka-tcp-analyze.sh             Analysis script — computes BDP, writes configs
-│   └── kafka-tcp-k8s.yaml               Kubernetes PVC, Job, and reader pod manifests
+│   ├── kafka-tcp-k8s.yaml               Kubernetes PVC, Job, and reader pod manifests
+│   └── kafka-sysctl-tuner.yaml          Kubernetes DaemonSet to modify node TCP settings
 │
 ├── dashboards/
 │   ├── tcp-throughput-explainer.jsx     Interactive TCP explainer (React)

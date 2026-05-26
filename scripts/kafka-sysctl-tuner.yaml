@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kafka-sysctl-tuner
+  namespace: confluent
+spec:
+  selector:
+    matchLabels:
+      app: kafka-sysctl-tuner
+  template:
+    metadata:
+      labels:
+        app: kafka-sysctl-tuner
+    spec:
+      hostNetwork: true
+      hostPID: true
+      tolerations:
+        - operator: Exists
+      initContainers:
+        - name: sysctl-tuner
+          image: busybox
+          securityContext:
+            privileged: true
+          command:
+            - sh
+            - -c
+            - |
+              echo "Before:"
+              sysctl net.core.rmem_max net.core.wmem_max \
+                     net.core.rmem_default net.core.wmem_default \
+                     net.ipv4.tcp_congestion_control \
+                     net.core.default_qdisc
+
+              echo "Tuning sysctl parameters for Kafka performance..."
+              sysctl -w net.core.rmem_max=134217728
+              sysctl -w net.core.wmem_max=134217728
+              sysctl -w net.core.rmem_default=67108864
+              sysctl -w net.core.wmem_default=67108864
+              
+              # Modern congestion control (BBR recommended on high-BDP paths)
+              sysctl -w net.ipv4.tcp_congestion_control=bbr
+              sysctl -w net.core.default_qdisc=fq
+
+              echo "After:"
+              sysctl net.core.rmem_max net.core.wmem_max \
+                     net.core.rmem_default net.core.wmem_default \
+                     net.ipv4.tcp_congestion_control \
+                     net.core.default_qdisc
+      containers:
+        - name: pause
+          image: gcr.io/google-containers/pause:3.1
+          resources:
+            requests:
+              cpu: 1m
+              memory: 1Mi
+            limits:
+              cpu: 10m
+              memory: 8Mi
+      nodeSelector:
+        cloud.google.com/gke-nodepool: default-pool
