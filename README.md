@@ -144,11 +144,18 @@ ss -tinp | grep <kafka-port> | grep nonagle
 
 The `.jsx` files in `dashboards/` are self-contained React components with no external API calls.
 
-**Option A — paste into Claude**
+| Option | Requires | Daemon? | Best for |
+|---|---|---|---|
+| A — Docker | Docker | Yes | Persistent local hosting |
+| B — Podman / nerdctl | podman or nerdctl | No | Daemonless drop-in replacement |
+| C — Buildah | buildah | No | Daemonless OCI image build |
+| D — Static files | node + python3 | No | Dev, netshoot, no image needed |
+| E — Local dev server | node | No | Development with hot reload |
+| F — CodeSandbox | browser | — | Shareable online sandbox |
 
-Start a new Claude conversation, paste the file contents, and say "render this".
+---
 
-**Option B — Docker (both apps, no setup)**
+**Option A — Docker**
 
 ```bash
 # From repo root
@@ -159,23 +166,107 @@ docker build -t tcp-kafka-viz docker/
 docker run -p 3001:3001 -p 3002:3002 tcp-kafka-viz
 ```
 
-| URL | App |
-|---|---|
-| `http://localhost:3001` | TCP Throughput Explainer |
-| `http://localhost:3002` | Kafka TCP Tuning Dashboard |
+The image is ~15 MB (Alpine + busybox-extras + two ~570 KB JS bundles). No Node at runtime — `httpd` from `busybox-extras` serves the static build output. Note: invoke as `httpd` directly, not `busybox httpd` — the latter form fails on Alpine.
 
-The image is ~15 MB (Alpine base + two ~570 KB JS bundles). No Node at runtime — busybox `httpd` serves the static build output.
+---
 
-**Option C — local dev**
+**Option B — Podman / nerdctl (daemonless, drop-in replacement)**
+
+Both tools are compatible with the existing `Dockerfile` and `docker-compose.yml` without any changes.
+
+Podman (common on RHEL/Fedora; available via `brew install podman` on macOS):
+
+```bash
+podman build -t tcp-kafka-viz docker/
+podman run -p 3001:3001 -p 3002:3002 tcp-kafka-viz
+
+# Or with the compose file
+podman compose -f docker/docker-compose.yml up
+```
+
+nerdctl (containerd-native; common on k3s, Rancher, EKS nodes):
+
+```bash
+nerdctl build -t tcp-kafka-viz docker/
+nerdctl run -p 3001:3001 -p 3002:3002 tcp-kafka-viz
+```
+
+Both are rootless by default and produce standard OCI images pushable to any registry.
+
+---
+
+**Option C — Buildah (daemonless, no root required)**
+
+Buildah builds OCI-compliant images without a Docker daemon and without root. The existing `Dockerfile` works unchanged:
+
+```bash
+buildah bud -t tcp-kafka-viz docker/
+```
+
+Run with Podman (which is typically paired with Buildah):
+
+```bash
+podman run -p 3001:3001 -p 3002:3002 tcp-kafka-viz
+```
+
+Or export to a tar archive for transfer:
+
+```bash
+buildah push tcp-kafka-viz docker-archive:tcp-kafka-viz.tar
+```
+
+---
+
+**Option D — Static files (no image, no daemon)**
+
+Both apps build to plain static HTML + JS. The built output can be served by anything — including tools already present in `nicolaka/netshoot`.
+
+Build first (requires `node`):
+
+```bash
+cd docker/tcp   && npm install && npm run build   # → docker/tcp/dist/
+cd docker/kafka && npm install && npm run build   # → docker/kafka/dist/
+```
+
+Serve with Python (present in netshoot and most systems):
+
+```bash
+python3 -m http.server 3001 --directory docker/tcp/dist &
+python3 -m http.server 3002 --directory docker/kafka/dist &
+```
+
+Or with `npx serve` (downloads on first run if node is available):
+
+```bash
+npx serve -l 3001 docker/tcp/dist &
+npx serve -l 3002 docker/kafka/dist &
+```
+
+Both are single commands with no persistent process or port — stop with `kill %1 %2` or `pkill -f http.server`.
+
+---
+
+**Option E — Local dev server (hot reload)**
 
 ```bash
 cd docker/tcp   && npm install && npm run dev   # → http://localhost:5173
 cd docker/kafka && npm install && npm run dev   # → http://localhost:5174
 ```
 
-**Option D — CodeSandbox**
+Vite's dev server watches for changes and reloads instantly — useful when editing the `.jsx` files directly.
 
-Open [codesandbox.io/s/new](https://codesandbox.io/s/new), replace `App.js` with the `.jsx` content, and run. Requires `recharts` in the sandbox dependencies.
+---
+
+**Option F — CodeSandbox**
+
+Open [codesandbox.io/s/new](https://codesandbox.io/s/new), replace `App.js` with the `.jsx` content, and run. Add `recharts` to the sandbox dependencies.
+
+---
+
+| URL | App |
+|---|---|
+| `http://localhost:3001` | TCP Throughput Explainer |
+| `http://localhost:3002` | Kafka TCP Tuning Dashboard |
 
 ---
 

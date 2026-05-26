@@ -220,16 +220,8 @@ function BbrComparison() {
             {label:"Switch buffer depth", val:buf, set:setBuf, min:5, max:200, step:5,
               fmt: v=>`${v} MSS`, color:P.yellow},
           ].map(({label,val,set,min,max,step,fmt,color}) => (
-            <div key={label}>
-              <div style={{display:"flex", justifyContent:"space-between", marginBottom:5}}>
-                <span style={{color:P.muted, fontSize:"0.8em"}}>{label}</span>
-                <span style={{color, fontFamily:"monospace", fontSize:"0.85em",
-                  fontWeight:700}}>{fmt(val)}</span>
-              </div>
-              <input type="range" min={min} max={max} step={step} value={val}
-                onChange={e=>set(+e.target.value)}
-                style={{width:"100%", accentColor:color}} />
-            </div>
+            <SliderField key={label} label={label} val={val} set={set}
+              min={min} max={max} step={step} fmt={fmt} color={color} />
           ))}
         </div>
         {/* Derived info */}
@@ -506,6 +498,54 @@ const ChartHeader = ({ title, logY, setLogY }) => (
     <LogToggle value={logY} onChange={setLogY} />
   </div>
 );
+
+// ─── SliderField: range slider + click-to-type value ────────────────────────
+function SliderField({label, val, set, min, max, step, fmt, color}) {
+  const [editing, setEditing] = React.useState(false);
+  const [draft,   setDraft]   = React.useState("");
+
+  const startEdit = () => { setDraft(String(val)); setEditing(true); };
+  const commit    = () => {
+    const n = parseFloat(draft);
+    if (!isNaN(n)) set(Math.min(max, Math.max(min, n)));
+    setEditing(false);
+  };
+  const onKey = e => {
+    if (e.key === "Enter")  commit();
+    if (e.key === "Escape") setEditing(false);
+  };
+
+  return (
+    <div>
+      <div style={{display:"flex", justifyContent:"space-between",
+        alignItems:"center", marginBottom:5}}>
+        <span style={{color:P.muted, fontSize:"0.8em"}}>{label}</span>
+        {editing ? (
+          <input autoFocus type="number" min={min} max={max} step={step}
+            value={draft}
+            onChange={e => setDraft(e.target.value)}
+            onBlur={commit} onKeyDown={onKey}
+            style={{width:88, textAlign:"right", background:"#0d1117",
+              border:`1px solid ${color}`, borderRadius:4, color,
+              fontFamily:"monospace", fontSize:"0.85em", fontWeight:700,
+              padding:"1px 4px", outline:"none"}} />
+        ) : (
+          <span onClick={startEdit} title="Click to type a value"
+            style={{color, fontFamily:"monospace", fontSize:"0.85em",
+              fontWeight:700, cursor:"text",
+              borderBottom:`1px dashed ${color}55`, paddingBottom:1,
+              userSelect:"none"}}>
+            {fmt(val)}
+          </span>
+        )}
+      </div>
+      <input type="range" min={min} max={max} step={step} value={val}
+        onChange={e => set(+e.target.value)}
+        style={{width:"100%", accentColor:color}} />
+    </div>
+  );
+}
+
 function BdpCalc() {
   const [bw, setBw] = useState(1000);
   const [rtt, setRtt] = useState(80);
@@ -521,20 +561,14 @@ function BdpCalc() {
       </div>
       <div style={{display:"flex", gap:24, flexWrap:"wrap", marginBottom:20}}>
         <div style={{flex:1, minWidth:160}}>
-          <label style={{color:P.muted, fontSize:"0.8em", display:"block", marginBottom:6}}>
-            Bandwidth: <span style={{color:P.accent, fontWeight:700}}>{bw >= 1000 ? `${(bw/1000).toFixed(bw%1000===0?0:1)} Gbps` : `${bw} Mbps`}</span>
-          </label>
-          <input type="range" min="10" max="50000" step="10" value={bw}
-            onChange={e=>setBw(+e.target.value)}
-            style={{width:"100%", accentColor:P.accent}} />
+          <SliderField label="Bandwidth" val={bw} set={setBw}
+            min={10} max={50000} step={10} color={P.accent}
+            fmt={v => v>=1000 ? `${(v/1000).toFixed(v%1000===0?0:1)} Gbps` : `${v} Mbps`} />
         </div>
         <div style={{flex:1, minWidth:160}}>
-          <label style={{color:P.muted, fontSize:"0.8em", display:"block", marginBottom:6}}>
-            RTT: <span style={{color:P.green, fontWeight:700}}>{rtt} ms</span>
-          </label>
-          <input type="range" min="1" max="500" step="1" value={rtt}
-            onChange={e=>setRtt(+e.target.value)}
-            style={{width:"100%", accentColor:P.green}} />
+          <SliderField label="RTT" val={rtt} set={setRtt}
+            min={1} max={500} step={1} color={P.green}
+            fmt={v => `${v} ms`} />
         </div>
       </div>
       <div style={{display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(160px,1fr))", gap:12}}>

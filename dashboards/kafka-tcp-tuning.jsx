@@ -274,19 +274,75 @@ const StatBox = ({label, value, sub, color=P.accent, warn=false}) => (
   </div>
 );
 
-const Slider = ({label, value, min, max, step=1, unit="", onChange, color=P.accent}) => (
-  <div style={{marginBottom:10}}>
-    <div style={{display:"flex", justifyContent:"space-between", marginBottom:4}}>
-      <Label c={P.muted}>{label}</Label>
-      <span style={{color, fontFamily:"monospace", fontSize:"0.85em", fontWeight:700}}>
-        {value}{unit}
-      </span>
+const Slider = ({label, value, min, max, step=1, unit="", onChange, color=P.accent}) => {
+  const [editing, setEditing] = useState(false);
+  const [draft,   setDraft]   = useState("");
+
+  const startEdit = () => {
+    setDraft(String(value));
+    setEditing(true);
+  };
+
+  const commitEdit = () => {
+    const n = parseFloat(draft);
+    if (!isNaN(n)) {
+      onChange(Math.min(max, Math.max(min, n)));
+    }
+    setEditing(false);
+  };
+
+  const handleKey = e => {
+    if (e.key === "Enter")  commitEdit();
+    if (e.key === "Escape") setEditing(false);
+  };
+
+  return (
+    <div style={{marginBottom:10}}>
+      <div style={{display:"flex", justifyContent:"space-between",
+        alignItems:"center", marginBottom:4}}>
+        <Label c={P.muted}>{label}</Label>
+        {editing ? (
+          <input
+            autoFocus
+            type="number"
+            min={min} max={max} step={step}
+            value={draft}
+            onChange={e => setDraft(e.target.value)}
+            onBlur={commitEdit}
+            onKeyDown={handleKey}
+            style={{
+              width: 90, textAlign:"right",
+              background:"#0d1117",
+              border:`1px solid ${color}`,
+              borderRadius:4,
+              color,
+              fontFamily:"monospace", fontSize:"0.85em", fontWeight:700,
+              padding:"1px 4px",
+              outline:"none",
+            }}
+          />
+        ) : (
+          <span
+            onClick={startEdit}
+            title="Click to type a value"
+            style={{
+              color, fontFamily:"monospace", fontSize:"0.85em", fontWeight:700,
+              cursor:"text",
+              borderBottom:`1px dashed ${color}55`,
+              paddingBottom:1,
+              userSelect:"none",
+            }}
+          >
+            {value}{unit}
+          </span>
+        )}
+      </div>
+      <input type="range" min={min} max={max} step={step} value={value}
+        onChange={e => onChange(+e.target.value)}
+        style={{width:"100%", accentColor:color, height:4}} />
     </div>
-    <input type="range" min={min} max={max} step={step} value={value}
-      onChange={e=>onChange(+e.target.value)}
-      style={{width:"100%", accentColor:color, height:4}} />
-  </div>
-);
+  );
+};
 
 const CodeBlock = ({children, title}) => (
   <div style={{marginTop:12}}>
@@ -553,11 +609,11 @@ sudo sysctl --system`;
               sub={`min ${fmtBytes(calc.batchMin)} (BDP÷inflight)`} />
             <StatBox label="linger.ms (thru)" value={`${calc.lingerThru} ms`} color={P.orange}
               sub="BDP drain time at measured BW" />
-            <StatBox label="Est. Kafka throughput"
+            <StatBox label="Total wire throughput"
               value={`${fmtMbps(calc.effectiveMbps)} wire`} color={P.green}
               warn={calc.effectiveMbps < custom.bwMbps * 0.5}
-              sub={`${fmtMbps(calc.effectiveLogicalMbps)} app data (×${compressionRatio} compression)`} />
-            <StatBox label={`Per-partition (÷${partitions})`}
+              sub={`${fmtMbps(calc.effectiveLogicalMbps)} app data · independent of partition count`} />
+            <StatBox label={`Per partition (${partitions}p)`}
               value={`${fmtMbps(calc.perPartWireMbps)} wire`} color={P.cyan}
               warn={calc.perPartBdpPct < 20}
               sub={`${fmtMbps(calc.perPartLogicalMbps)} app data · ${calc.perPartBdpPct}% BDP util`} />
@@ -592,9 +648,9 @@ sudo sysctl --system`;
             {[
               {label:"Link ceiling",          value:fmtMbps(custom.bwMbps),               color:P.muted,  sub:"raw bandwidth"},
               {label:"Window-limited",         value:fmtMbps(calc.kafkaWindowMbps),         color:P.yellow, sub:"batch×inflight÷RTT (F1)"},
-              {label:"Wire throughput",        value:fmtMbps(calc.effectiveMbps),           color:P.accent, sub: calc.mathisMbps ? "Mathis-limited (loss)" : "bytes on the wire"},
-              {label:"App data rate",          value:fmtMbps(calc.effectiveLogicalMbps),    color:P.green,  sub:`wire × ${compressionRatio}× — can exceed wire`},
-              {label:`Wire / partition (÷${partitions})`, value:fmtMbps(calc.perPartWireMbps), color:P.cyan, sub:`${fmtMbps(calc.perPartLogicalMbps)} app data`},
+              {label:"Total wire throughput",  value:fmtMbps(calc.effectiveMbps),           color:P.accent, sub: calc.mathisMbps ? "Mathis-limited (loss)" : "all partitions combined"},
+              {label:"Total app data rate",    value:fmtMbps(calc.effectiveLogicalMbps),    color:P.green,  sub:`wire × ${compressionRatio}× — partition-independent`},
+              {label:`Per partition (${partitions}p)`, value:fmtMbps(calc.perPartWireMbps), color:P.cyan,   sub:`${fmtMbps(calc.perPartLogicalMbps)} app data`},
             ].map(({label,value,color,sub}) => (
               <div key={label} style={{background:P.panel, border:`1px solid ${color}33`,
                 borderRadius:8, padding:"12px 14px"}}>
@@ -609,13 +665,14 @@ sudo sysctl --system`;
           {/* Wire vs app data clarification */}
           <div style={{background:P.panel2, border:`1px solid ${P.border}`, borderRadius:8,
             padding:"10px 14px", fontSize:"0.8em", color:P.muted, lineHeight:1.6}}>
-            <span style={{color:P.text, fontWeight:600}}>Wire vs app data rate: </span>
-            Wire throughput is bytes sent over the network.
-            App data rate is the logical payload delivered to the consumer after decompression —
-            it can exceed wire throughput because Kafka compresses entire batches before transmission.
-            A {compressionRatio}× ratio means {fmtMbps(calc.effectiveMbps)} on the wire delivers{" "}
-            {fmtMbps(calc.effectiveLogicalMbps)} of application data.
-            Per-partition figures always show wire first so they can be compared to link capacity.
+            <span style={{color:P.text, fontWeight:600}}>Total vs per-partition: </span>
+            Total wire throughput and app data rate are fixed by bandwidth, RTT, window size, and loss —
+            they do not change with partition count. The partition count divides that total capacity
+            across partitions: more partitions means less throughput available per partition.
+            The <span style={{color:P.cyan, fontFamily:"monospace"}}>Per partition ({partitions}p)</span> box
+            and chart respond to the Partitions slider.
+            A {compressionRatio}× compression ratio means {fmtMbps(calc.effectiveMbps)} wire
+            delivers {fmtMbps(calc.effectiveLogicalMbps)} of application data in total.
           </div>
 
           {/* Throughput breakdown explanation */}
