@@ -501,8 +501,8 @@ const ChartHeader = ({ title, logY, setLogY }) => (
 
 // ─── SliderField: range slider + click-to-type value ────────────────────────
 function SliderField({label, val, set, min, max, step, fmt, color}) {
-  const [editing, setEditing] = React.useState(false);
-  const [draft,   setDraft]   = React.useState("");
+  const [editing, setEditing] = useState(false);
+  const [draft,   setDraft]   = useState("");
 
   const startEdit = () => { setDraft(String(val)); setEditing(true); };
   const commit    = () => {
@@ -601,6 +601,7 @@ export default function App() {
 
   // Per-chart log-Y toggle state
   const [logBdp,   setLogBdp]   = useState(true);   // BDP chart (already log)
+  const [logTputRtt, setLogTputRtt] = useState(true); // new: throughput vs RTT in section 1
   const [logWin,   setLogWin]   = useState(false);  // throughput vs window
   const [logRtt,   setLogRtt]   = useState(true);   // throughput vs RTT (already log)
   const [logCwnd,  setLogCwnd]  = useState(false);  // cwnd sawtooth
@@ -664,6 +665,34 @@ export default function App() {
             <Legend wrapperStyle={{fontSize:"0.8em", paddingTop:8}} />
             {["100Mbps","1000Mbps","10000Mbps","50000Mbps"].map((k,i) => (
               <Line key={k} type="monotone" dataKey={k} dot={false} strokeWidth={2} stroke={COLORS[i]} />
+            ))}
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+
+      {/* Chart: Max Throughput vs RTT — paired with BDP chart above */}
+      <div style={{background:P.panel, border:`1px solid ${P.border}`, borderRadius:10,
+        padding:"20px 16px", margin:"20px 0"}}>
+        <ChartHeader title="Max Throughput (Mbps) vs RTT — by Window Size" logY={logTputRtt} setLogY={setLogTputRtt} />
+        <div style={{color:P.muted, fontSize:"0.79em", marginBottom:10, lineHeight:1.6}}>
+          The inverse view of BDP: for a fixed window size, throughput falls hyperbolically
+          as RTT rises — T = W / RTT (F1). Each line is a different window size.
+          The 64 KB default (dashed red) becomes the bottleneck on any high-latency path.
+        </div>
+        <ResponsiveContainer width="100%" height={240}>
+          <LineChart data={rttRows} margin={{top:4,right:20,bottom:20,left:20}}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#21262d" />
+            <XAxis dataKey="rtt" stroke={P.muted} tick={{fontSize:11}}
+              label={{value:"RTT (ms)", position:"insideBottom", dy:14, fill:P.muted, fontSize:11}} />
+            <YAxis {...yAxisProps(logTputRtt, 0.1, "Throughput (Mbps)")} />
+            <Tooltip contentStyle={{background:P.panel,border:`1px solid ${P.border}`,borderRadius:8,fontSize:"0.82em"}}
+              formatter={(v,n)=>[`${v.toFixed(1)} Mbps`, `Win=${n}`]} />
+            <Legend wrapperStyle={{fontSize:"0.8em",paddingTop:8}} />
+            {["64KB","256KB","1024KB","4096KB","16384KB"].map((k,i) => (
+              <Line key={k} type="monotone" dataKey={k} dot={false}
+                strokeWidth={k==="64KB" ? 1.5 : 2}
+                strokeDasharray={k==="64KB" ? "4 3" : undefined}
+                stroke={k==="64KB" ? P.red : COLORS[i+1]} />
             ))}
           </LineChart>
         </ResponsiveContainer>
