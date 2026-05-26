@@ -1,0 +1,145 @@
+# =============================================================================
+# kafka-tcp-k8s.yaml
+# Kubernetes manifests for the kafka-tcp measurement and analysis tooling.
+#
+# Resources (apply in order, or all at once — kubectl apply -f kafka-tcp-k8s.yaml):
+#   1. ConfigMap      — kafka-tcp-scripts   (measure + analyze scripts)
+#   2. PVC            — kafka-tcp-results   (persistent result storage)
+#   3. Job            — kafka-tcp-measure   (runs measurement + analysis)
+#   4. Pod (optional) — results-reader      (access results after job completes)
+#
+# Usage:
+#   # 1. Create ConfigMap from local script files:
+#   kubectl create configmap kafka-tcp-scripts \
+#     --from-file=kafka-tcp-measure.sh \
+#     --from-file=kafka-tcp-analyze.sh
+#
+#   # 2. Apply the remaining resources:
+#   kubectl apply -f kafka-tcp-k8s.yaml
+#
+#   # 3. Watch the job:
+#   kubectl logs -f job/kafka-tcp-measure
+#
+#   # 4. Retrieve results:
+#   kubectl cp results-reader:/results ./kafka-tcp-results-local
+# =============================================================================
+
+---
+# ── PersistentVolumeClaim ─────────────────────────────────────────────────────
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kafka-tcp-results
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  # storageClassName: standard   # uncomment and set to match your cluster
+  #   kubectl get storageclass   # lists available classes
+
+---
+# ── Measurement + Analysis Job ────────────────────────────────────────────────
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kafka-tcp-measure
+  namespace: default
+spec:
+  ttlSecondsAfterFinished: 3600    # pod cleaned up 1h after completion
+  backoffLimit: 0                  # no retries — partial results are misleading
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: netshoot
+          image: nicolaka/netshoot
+          command:
+            - bash
+            - -c
+            - |
+              # Capture timestamp once so both scripts share the same output dir.
+              # Do NOT use $(date) inline in each command — the shell would
+              # evaluate them at different times, producing different paths.
+              TIMESTAMP=$(date +%Y%m%d-%H%M%S) &&
+              /scripts/kafka-tcp-measure.sh \
+                -t 10.4.3.8 \
+                -p 5201 \
+                -s 8 \
+                -o /results/$TIMESTAMP &&
+              /scripts/kafka-tcp-analyze.sh \
+                -d /results/$TIMESTAMP \
+                -c 8 \
+                -m 1500 \
+                -l 50
+
+          # ── Adjust these to match your broker and requirements ──────────────
+          # -t  broker IP or hostname
+          # -p  iperf3 server port (default 5201)
+          # -s  parallel streams — match Kafka producer concurrency
+          # -c  Kafka connections per broker
+          # -m  path MTU (1500 standard, 9000 jumbo frames)
+          # -l  end-to-end latency SLA in ms
+
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true        # ConfigMap mounts are always read-only
+            - name: results
+              mountPath: /results   # PVC — writable, persists after pod exits
+
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+
+      volumes:
+        - name: scripts
+          configMap:
+            name: kafka-tcp-scripts
+            defaultMode: 0755       # makes scripts directly executable
+        - name: results
+          persistentVolumeClaim:
+            claimName: kafka-tcp-results
+
+---
+# ── Results Reader Pod ────────────────────────────────────────────────────────
+# Long-lived pod for browsing and copying results after the job completes.
+# The job pod must have terminated (or the PVC must be ReadWriteMany) before
+# this pod can bind to the PVC on ReadWriteOnce storage.
+#
+# Apply:   kubectl apply -f kafka-tcp-k8s.yaml
+# Access:  kubectl exec -it results-reader -- ls /results
+# Copy:    kubectl cp results-reader:/results ./kafka-tcp-results-local
+# Remove:  kubectl delete pod results-reader
+apiVersion: v1
+kind: Pod
+metadata:
+  name: results-reader
+  namespace: default
+spec:
+  containers:
+    - name: reader
+      image: busybox
+      command: ["sleep", "infinity"]
+      volumeMounts:
+        - name: results
+          mountPath: /results
+          readOnly: true
+      resources:
+        requests:
+          cpu: "10m"
+          memory: "16Mi"
+        limits:
+          cpu: "100m"
+          memory: "32Mi"
+  volumes:
+    - name: results
+      persistentVolumeClaim:
+        claimName: kafka-tcp-results
+        readOnly: true

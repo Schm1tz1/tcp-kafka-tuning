@@ -1,0 +1,8 @@
+services:
+  viz:
+    build: .
+    image: tcp-kafka-viz:latest
+    ports:
+      - "3001:3001"   # TCP Throughput Explainer
+      - "3002:3002"   # Kafka TCP Tuning
+    restart: unless-stopped

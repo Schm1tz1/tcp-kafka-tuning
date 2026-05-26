@@ -1,0 +1,21 @@
+# Node / build artefacts
+node_modules/
+dist/
+.vite/
+*.local
+
+# npm/yarn lockfiles — commit package-lock.json if you want reproducible builds,
+# otherwise exclude. Excluded here to keep the repo clean for sharing.
+package-lock.json
+
+# Measurement results (generated at runtime)
+results/
+results-*/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
