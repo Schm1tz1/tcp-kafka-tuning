@@ -1,0 +1,44 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build TCP app
+        working-directory: docker/tcp
+        run: npm install && npm run build
+
+      - name: Build Kafka app
+        working-directory: docker/kafka
+        run: npm install && npm run build
+
+      - name: Assemble docs/
+        run: |
+          mkdir -p docs/tcp docs/kafka
+          cp -r docker/tcp/dist/*   docs/tcp/
+          cp -r docker/kafka/dist/* docs/kafka/
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/
+
+      - uses: actions/deploy-pages@v4
+        id: deployment
