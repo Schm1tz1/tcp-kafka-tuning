@@ -10,8 +10,7 @@ A self-contained reference for diagnosing and optimising throughput across the I
 
 ```
 ├── docs/
-│   ├── kafka-tcp-tuning-guide.md        Full technical reference (Markdown)
-│   └── kafka-tcp-tuning-guide.docx      Word version for formal distribution
+│   └── kafka-tcp-tuning-guide.md        Full technical reference (Markdown)
 │
 ├── scripts/
 │   ├── kafka-tcp-measure.sh             Measurement script (ping + iperf3)
