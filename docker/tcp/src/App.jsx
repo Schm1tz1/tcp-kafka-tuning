@@ -603,7 +603,6 @@ export default function App() {
   const [logBdp,   setLogBdp]   = useState(true);   // BDP chart (already log)
   const [logTputRtt, setLogTputRtt] = useState(true); // new: throughput vs RTT in section 1
   const [logWin,   setLogWin]   = useState(false);  // throughput vs window
-  const [logRtt,   setLogRtt]   = useState(true);   // throughput vs RTT (already log)
   const [logCwnd,  setLogCwnd]  = useState(false);  // cwnd sawtooth
   const [logMath,  setLogMath]  = useState(true);   // Mathis (already log)
 
@@ -746,23 +745,56 @@ export default function App() {
         matter so much for WAN/CDN performance.
       </p>
 
-      <div style={{background:P.panel, border:`1px solid ${P.border}`, borderRadius:10,
-        padding:"20px 16px", margin:"20px 0"}}>
-        <ChartHeader title="Throughput (Mbps) vs RTT — by Window Size" logY={logRtt} setLogY={setLogRtt} />
-        <ResponsiveContainer width="100%" height={240}>
-          <LineChart data={rttRows} margin={{top:4,right:20,bottom:20,left:20}}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#21262d" />
-            <XAxis dataKey="rtt" stroke={P.muted} tick={{fontSize:11}}
-              label={{value:"RTT (ms)", position:"insideBottom", dy:14, fill:P.muted, fontSize:11}} />
-            <YAxis {...yAxisProps(logRtt, 0.1, "Throughput (Mbps)")} />
-            <Tooltip contentStyle={{background:P.panel,border:`1px solid ${P.border}`,borderRadius:8,fontSize:"0.82em"}}
-              formatter={(v,n)=>[`${v.toFixed(1)} Mbps`, `Win=${n}`]} />
-            <Legend wrapperStyle={{fontSize:"0.8em",paddingTop:8}} />
-            {["64KB","256KB","1024KB","4096KB","16384KB"].map((k,i) => (
-              <Line key={k} type="monotone" dataKey={k} dot={false} strokeWidth={2} stroke={COLORS[i]} />
-            ))}
-          </LineChart>
-        </ResponsiveContainer>
+      {/* Scenario BDP / window utilisation breakdown table */}
+      <div style={{overflowX:"auto", margin:"16px 0 24px"}}>
+        <table style={{width:"100%", borderCollapse:"collapse", fontSize:"0.84em"}}>
+          <thead>
+            <tr style={{borderBottom:`2px solid ${P.border}`}}>
+              {["Scenario","Bandwidth","RTT","BDP","64KB window util","1MB window util","Rec. window"].map(h => (
+                <th key={h} style={{padding:"8px 12px", textAlign:"left", color:P.muted,
+                  fontWeight:600, letterSpacing:"0.04em", fontSize:"0.85em", whiteSpace:"nowrap"}}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {[
+              {label:"Local DC",     bwMbps:10000, rttMs:0.2},
+              {label:"Same-AZ",      bwMbps:1000,  rttMs:2},
+              {label:"Cross-AZ",     bwMbps:1000,  rttMs:12},
+              {label:"Cross-Region", bwMbps:500,   rttMs:60},
+              {label:"Multi-Region", bwMbps:200,   rttMs:150},
+              {label:"Satellite",    bwMbps:50,    rttMs:600},
+            ].map(({label, bwMbps, rttMs}, i) => {
+              const bdpBytes  = (bwMbps * 1e6 / 8) * (rttMs / 1000);
+              const util64k   = Math.min(100, (65536  / bdpBytes * 100));
+              const util1m    = Math.min(100, (1048576 / bdpBytes * 100));
+              const recWin    = bdpBytes >= 1073741824
+                ? `${(bdpBytes/1073741824).toFixed(1)} GB`
+                : bdpBytes >= 1048576
+                  ? `${(bdpBytes/1048576).toFixed(1)} MB`
+                  : `${(bdpBytes/1024).toFixed(0)} KB`;
+              const u64color  = util64k  < 5  ? P.red : util64k  < 30 ? P.yellow : P.green;
+              const u1mcolor  = util1m   < 10 ? P.red : util1m   < 60 ? P.yellow : P.green;
+              return (
+                <tr key={label} style={{borderBottom:`1px solid ${P.border}`,
+                  background: i%2===0 ? "transparent" : "#161b22"}}>
+                  <td style={{padding:"9px 12px", color:P.text, fontWeight:600}}>{label}</td>
+                  <td style={{padding:"9px 12px", color:P.cyan,   fontFamily:"monospace"}}>
+                    {bwMbps >= 1000 ? `${bwMbps/1000} Gbps` : `${bwMbps} Mbps`}
+                  </td>
+                  <td style={{padding:"9px 12px", color:P.green,  fontFamily:"monospace"}}>{rttMs} ms</td>
+                  <td style={{padding:"9px 12px", color:P.yellow, fontFamily:"monospace"}}>{recWin}</td>
+                  <td style={{padding:"9px 12px", color:u64color, fontFamily:"monospace"}}>{util64k.toFixed(1)}%</td>
+                  <td style={{padding:"9px 12px", color:u1mcolor, fontFamily:"monospace"}}>{util1m.toFixed(1)}%</td>
+                  <td style={{padding:"9px 12px", color:P.purple, fontFamily:"monospace"}}>{recWin}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+        <div style={{color:P.muted, fontSize:"0.78em", marginTop:8, paddingLeft:4}}>
+          Window utilisation = window size ÷ BDP × 100. Red = severely under-utilised. Recommended window = BDP (minimum to fill the pipe).
+        </div>
       </div>
 
       {/* ── 4. Congestion Window ──────────────────────────────────────────── */}

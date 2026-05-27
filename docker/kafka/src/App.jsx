@@ -388,7 +388,7 @@ const SCENARIO_TABLE = [
   { label:"Satellite (600ms)",  bw:"50 Mbps", rtt:"600ms", bdp:"~3.75 MB",batch:"1 MB",   rmem:"2 GB",    linger:"500", cc:"bbr",   acks:"1",  comp:"zstd"  },
 ];
 const TABLE_COLS = ["label","bw","rtt","bdp","batch","rmem","linger","cc","acks","comp"];
-const TABLE_HEADS = ["Scenario","Bandwidth","RTT","BDP","batch.size","tcp_rmem_max","linger.ms","CC","acks","compression"];
+const TABLE_HEADS = ["Scenario","Bandwidth","RTT","BDP","batch.size","tcp_rmem_max","linger.ms (thru)","CC","acks","compression"];
 
 // ── Main component ────────────────────────────────────────────────────────────
 export default function App() {
@@ -445,6 +445,8 @@ export default function App() {
     diag.push({type:"warn", msg:`10+ Gbps with standard MTU 1500 — consider jumbo frames (MTU 9000) on the Kafka VLAN for ~5× reduction in header overhead.`});
   if (custom.rttAvg > 100)
     diag.push({type:"warn", msg:`High RTT (${custom.rttAvg}ms) — linger.ms should be tuned carefully. Batch accumulation time must exceed BDP drain time (${calc.lingerThru}ms).`});
+  if (calc.lingerLatency === 0)
+    diag.push({type:"warn", msg:`Latency budget (${custom.latencyBudgetMs}ms) ≤ RTT (${custom.rttAvg}ms) + broker overhead (~2ms). linger.ms set to 0 in latency profile — batching disabled, throughput will be reduced.`});
   if (diag.length === 0)
     diag.push({type:"ok", msg:"Path looks healthy. Buffer and batch tuning will have direct impact."});
 
@@ -468,7 +470,7 @@ net.ipv4.tcp_keepalive_probes   = 3`;
 
 batch.size                            = ${calc.batchSize}
 linger.ms                             = ${calc.lingerThru}
-buffer.memory                         = ${calc.bufCeil * 2}
+buffer.memory                         = ${calc.bufCeil * 2}${calc.bufCeil * 2 > 1073741824 ? `  # ⚠ >1 GB — verify producer -Xmx heap` : ""}
 compression.type                      = lz4
 max.in.flight.requests.per.connection = ${inflight}
 acks                                  = all
@@ -481,6 +483,8 @@ delivery.timeout.ms                   = 120000`;
 
   const kafkaLatConf = `# LATENCY profile (budget: ${custom.latencyBudgetMs}ms)
 # RTT: ${custom.rttAvg}ms → linger headroom: ${calc.lingerLatency}ms
+# WARNING: acks=1 + enable.idempotence=false trades durability/ordering for latency.
+# Use acks=all + enable.idempotence=true if message ordering or durability is required.
 
 batch.size                            = 16384
 linger.ms                             = ${calc.lingerLatency}
@@ -1183,7 +1187,7 @@ sudo sysctl --system`;
                 {param:"max.in.flight",    dflt:"5",      rec:`${inflight} (tunable)`, color:P.accent,
                  note:"Pipeline depth. Effective window = batch.size × inflight."},
                 {param:"buffer.memory",    dflt:"32 MB",  rec:fmtBytes(calc.bufCeil*2), color:P.green,
-                 note:"Total producer buffer. Must cover all pending batches."},
+                 note:`Total producer buffer. Must cover all pending batches.${calc.bufCeil*2 > 1073741824 ? " ⚠ Exceeds 1 GB — verify producer host has sufficient heap (-Xmx)." : ""}`},
                 {param:"acks",             dflt:"1",      rec:"all (idempotent)", color:P.yellow,
                  note:"'all' requires min.insync.replicas=2. Latency +RTT_broker."},
               ].map(({param,dflt,rec,color,note}) => (
