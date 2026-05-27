@@ -84,7 +84,10 @@ function calcFromMeasurements({bwMbps, rttMin, rttAvg, plateauKB, conns, mtu, in
   const theoreticalBDP = Math.round(bwBytes * rttSMin);
   const mss       = mtu - 40;
   const bufCeil   = nextPow2(empiricalBDP * conns * 2);
-  const batchMin  = Math.round(empiricalBDP / inflight);
+  // batchMin = max(BDP÷inflight, 2×MSS) — must cover the per-connection window slice
+  // AND be large enough to hold at least 2 full frames (avoids sub-frame batches on
+  // jumbo-frame paths where MSS=8960 and BDP is small relative to link speed).
+  const batchMin  = Math.max(Math.round(empiricalBDP / inflight), mss * 2);
   const batchSize = nearestBatch(batchMin);
   const lingerThru    = Math.max(1, Math.round((empiricalBDP*8)/(bwMbps*1e6)*1000));
   const lingerLatency = Math.max(0, Math.round(latencyBudgetMs - rttAvg - 2));
@@ -413,8 +416,10 @@ export default function App() {
     latencyBudgetMs: scen.latency,
   });
 
-  // Auto-derive plateau from BDP for simulation
-  const simBDP = custom.bwMbps * 1e6 / 8 * custom.rttMin / 1000;
+  // Auto-derive plateau from BDP for simulation.
+  // Use rttAvg (operating RTT) not rttMin (ping floor) — batch sizing must cover
+  // the average in-flight window, not the theoretical minimum propagation delay.
+  const simBDP = custom.bwMbps * 1e6 / 8 * custom.rttAvg / 1000;
   const plateauKB = Math.max(4, Math.ceil(simBDP / 1024));
 
   const calc = calcFromMeasurements({
