@@ -1,8 +1,7 @@
-import { useState, useEffect, useRef } from "react";
+import { useState } from "react";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
-  ResponsiveContainer, ReferenceLine, Area, AreaChart,
-  ScatterChart, Scatter, Legend, Label, BarChart, Bar,
+  ResponsiveContainer, ReferenceLine, Area, AreaChart, Legend,
 } from "recharts";
 
 // ─── Data generators ──────────────────────────────────────────────────────────

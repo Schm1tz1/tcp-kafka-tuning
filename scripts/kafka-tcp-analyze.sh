@@ -26,6 +26,7 @@ DIM='\033[2m'
 info()    { echo -e "${CYAN}[INFO]${RESET}  $*"; }
 ok()      { echo -e "${GREEN}[ OK ]${RESET}  $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${RESET}  $*"; }
+error()   { echo -e "${RED}[ERR ]${RESET}  $*" >&2; exit 1; }
 rec()     { echo -e "${BLUE}[ REC]${RESET}  $*"; }
 section() { echo -e "\n${BOLD}══════════════════════════════════════════${RESET}"; \
             echo -e "${BOLD}  $*${RESET}"; \

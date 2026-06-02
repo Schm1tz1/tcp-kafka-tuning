@@ -37,8 +37,9 @@ spec:
   resources:
     requests:
       storage: 1Gi
-  # storageClassName: standard   # uncomment and set to match your cluster
-  #   kubectl get storageclass   # lists available classes
+  # storageClassName: standard   # REQUIRED on clusters with no default StorageClass.
+  #   If the PVC stays in Pending, run: kubectl get storageclass
+  #   Then set storageClassName to one of the listed names (e.g. standard, gp2, managed-premium).
 
 ---
 # ── Measurement + Analysis Job ────────────────────────────────────────────────
@@ -48,7 +49,8 @@ metadata:
   name: kafka-tcp-measure
   namespace: default
 spec:
-  ttlSecondsAfterFinished: 3600    # pod cleaned up 1h after completion
+  ttlSecondsAfterFinished: 86400   # pod cleaned up 24h after completion (results persist on PVC)
+  activeDeadlineSeconds: 7200      # abort the job if it hangs beyond 2h (e.g. iperf3 freeze)
   backoffLimit: 0                  # no retries — partial results are misleading
   template:
     spec:

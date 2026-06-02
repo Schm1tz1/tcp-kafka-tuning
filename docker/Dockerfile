@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # =============================================================================
 # Dockerfile — TCP Kafka Tuning visualisation tools
 #
@@ -28,23 +29,23 @@ WORKDIR /build
 
 # Build TCP app
 COPY tcp/package.json         tcp/
+COPY tcp/package-lock.json    tcp/
 COPY tcp/vite.config.js       tcp/
 COPY tcp/index.html           tcp/
 COPY tcp/src/                 tcp/src/
 
-RUN cd tcp \
- && npm install --prefer-offline --no-audit --no-fund \
- && npm run build
+RUN --mount=type=cache,target=/root/.npm \
+    cd tcp && npm ci --prefer-offline --no-audit --no-fund && npm run build
 
 # Build Kafka app
 COPY kafka/package.json       kafka/
+COPY kafka/package-lock.json  kafka/
 COPY kafka/vite.config.js     kafka/
 COPY kafka/index.html         kafka/
 COPY kafka/src/               kafka/src/
 
-RUN cd kafka \
- && npm install --prefer-offline --no-audit --no-fund \
- && npm run build
+RUN --mount=type=cache,target=/root/.npm \
+    cd kafka && npm ci --prefer-offline --no-audit --no-fund && npm run build
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
 # busybox-extras ships the httpd applet and installs as /usr/sbin/httpd.
@@ -52,13 +53,17 @@ RUN cd kafka \
 FROM alpine:3.20
 
 RUN apk add --no-cache busybox-extras \
+ && adduser -D -u 1000 appuser \
  && mkdir -p /srv/tcp /srv/kafka
 
 COPY --from=build /build/tcp/dist/   /srv/tcp/
 COPY --from=build /build/kafka/dist/ /srv/kafka/
 COPY scripts/entrypoint.sh           /entrypoint.sh
 
-RUN chmod +x /entrypoint.sh
+RUN chmod +x /entrypoint.sh \
+ && chown -R appuser:appuser /srv /entrypoint.sh
+
+USER appuser
 
 EXPOSE 3001 3002
 
