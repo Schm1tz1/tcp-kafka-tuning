@@ -1,8 +1,8 @@
-name: Deploy to GitHub Pages
+name: Deploy UAT to GitHub Pages
 
 on:
   push:
-    branches: [main]
+    branches: [uat]
 
 permissions:
   contents: write
@@ -24,13 +24,13 @@ jobs:
       - name: Build TCP app
         working-directory: docker/tcp
         env:
-          VITE_BASE: /tcp-kafka-tuning/tcp/
+          VITE_BASE: /tcp-kafka-tuning/uat/tcp/
         run: npm install && npm run build
 
       - name: Build Kafka app
         working-directory: docker/kafka
         env:
-          VITE_BASE: /tcp-kafka-tuning/kafka/
+          VITE_BASE: /tcp-kafka-tuning/uat/kafka/
         run: npm install && npm run build
 
       - name: Assemble dist/
@@ -43,4 +43,5 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: dist/
+          destination_dir: uat
           keep_files: true
