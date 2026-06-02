@@ -2,6 +2,7 @@ import { useState, useCallback } from "react";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, ReferenceLine, Legend, AreaChart, Area,
+  BarChart, Bar,
 } from "recharts";
 
 // ── Palette ──────────────────────────────────────────────────────────────────
