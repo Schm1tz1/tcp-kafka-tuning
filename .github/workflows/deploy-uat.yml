@@ -38,6 +38,7 @@ jobs:
           mkdir -p dist/tcp dist/kafka
           cp -r docker/tcp/dist/*   dist/tcp/
           cp -r docker/kafka/dist/* dist/kafka/
+          cp static/index.html      dist/index.html
 
       - uses: peaceiris/actions-gh-pages@v4
         with:
