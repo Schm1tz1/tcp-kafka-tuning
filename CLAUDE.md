@@ -37,18 +37,16 @@ The project is grounded in published network performance theory: Little's Law [1
 │   ├── scripts/entrypoint.sh          # starts two httpd instances
 │   ├── tcp/                           # Vite project for tcp-throughput-explainer
 │   │   ├── package.json               # react@18.3.1, recharts@2.12.7, vite@5.4.2
-│   │   ├── vite.config.js             # base: '/' — must change for GitHub Pages
+│   │   ├── vite.config.js             # base path + resolve.dedupe for out-of-root import
 │   │   ├── index.html
 │   │   └── src/
-│   │       ├── main.jsx
-│   │       └── App.jsx                # ← mirrors dashboards/tcp-throughput-explainer.jsx
+│   │       └── main.jsx               # imports ../../../dashboards/tcp-throughput-explainer.jsx
 │   └── kafka/
 │       ├── package.json
-│       ├── vite.config.js             # base: '/' — must change for GitHub Pages
+│       ├── vite.config.js             # base path + resolve.dedupe for out-of-root import
 │       ├── index.html
 │       └── src/
-│           ├── main.jsx
-│           └── App.jsx                # ← mirrors dashboards/kafka-tcp-tuning.jsx
+│           └── main.jsx               # imports ../../../dashboards/kafka-tcp-tuning.jsx
 │
 ├── docs/
 │   ├── kafka-tcp-tuning-guide.md      # full technical reference (537 lines, 10 sections)
@@ -59,14 +57,13 @@ The project is grounded in published network performance theory: Little's Law [1
 └── README.md
 ```
 
-### Critical sync rule
+### Single source of truth
 
-`docker/tcp/src/App.jsx` and `docker/kafka/src/App.jsx` are **copies** of the dashboard files. Whenever a dashboard is changed, both locations must be updated:
+`dashboards/tcp-throughput-explainer.jsx` and `dashboards/kafka-tcp-tuning.jsx` are the **only** copies of the dashboard code. The Vite projects in `docker/tcp/` and `docker/kafka/` import them directly via a relative path in `main.jsx` — there are no `App.jsx` files inside `docker/*/src/`.
 
-```bash
-cp dashboards/tcp-throughput-explainer.jsx docker/tcp/src/App.jsx
-cp dashboards/kafka-tcp-tuning.jsx         docker/kafka/src/App.jsx
-```
+`vite.config.js` in each project sets `resolve.dedupe` for `react`, `react-dom`, and `recharts` so that Vite resolves those packages from the project's own `node_modules` even though the source file lives outside the project root. `server.fs.allow` permits the dev server to serve the out-of-root file.
+
+Edit only `dashboards/*.jsx`. No manual copy step is needed.
 
 ---
 
