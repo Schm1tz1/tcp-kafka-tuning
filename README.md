@@ -33,15 +33,13 @@ A self-contained reference for diagnosing and optimising throughput across the I
 │   │   ├── vite.config.js
 │   │   ├── index.html
 │   │   └── src/
-│   │       ├── main.jsx
-│   │       └── App.jsx                  ← mirrors dashboards/tcp-throughput-explainer.jsx
+│   │       └── main.jsx
 │   └── kafka/                           Vite project for kafka-tcp-tuning
 │       ├── package.json
 │       ├── vite.config.js
 │       ├── index.html
 │       └── src/
-│           ├── main.jsx
-│           └── App.jsx                  ← mirrors dashboards/kafka-tcp-tuning.jsx
+│           └── main.jsx
 │
 ├── .gitignore
 └── README.md
