@@ -142,9 +142,8 @@ ss -tinp | grep <kafka-port> | grep nonagle
 
 The `.jsx` files in `dashboards/` are self-contained React components with no external API calls.
 
-Both applications are hosted here for testing on GitHub Pages:
-* https://schm1tz1.github.io/tcp-kafka-tuning/tcp/
-* https://schm1tz1.github.io/tcp-kafka-tuning/kafka/
+Both applications are hosted here for testing on GitHub Pages: 
+https://schm1tz1.github.io/tcp-kafka-tuning/
 
 For your deployments/sharing you have the following options:
 
