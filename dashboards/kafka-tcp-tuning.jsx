@@ -251,8 +251,8 @@ function calcFromMeasurements({bwMbps, rttMin, rttAvg, plateauKB, conns, mtu, in
 
   // num.network.threads: handles all I/O (producer, consumer, replication, inter-broker)
   // Rule of thumb: 1 thread per ~50 connections, minimum 8, scale up for large clusters
-  // For replication alone: need at least (brokers - 1) × num.replica.fetchers
-  const minNetworkThreadsForReplication = Math.max(0, brokers - 1) * numReplicaFetchers;
+  // For replication alone: need at least (brokers - 1) × num.replica.fetchers + 1 for clients
+  const minNetworkThreadsForReplication = Math.max(0, brokers - 1) * numReplicaFetchers + 1;
   const numNetworkThreads = Math.max(8, Math.ceil(perBrokerTotalConns / 50), minNetworkThreadsForReplication);
 
   // Total replication bandwidth (cluster-wide, for reference)
@@ -737,7 +737,7 @@ delivery.timeout.ms                   = 10000`;
 
 # Network threads: handles producer, consumer, replication, and inter-broker I/O
 # Calculated: ${calc.perBrokerTotalConns} total connections / 50 per thread
-# Minimum for replication: ${brokers} brokers × ${calc.numReplicaFetchers} fetchers = ${Math.max(0, brokers - 1) * calc.numReplicaFetchers}
+# Minimum for replication + clients: (${brokers}-1) × ${calc.numReplicaFetchers} + 1 = ${Math.max(0, brokers - 1) * calc.numReplicaFetchers + 1}
 num.network.threads                   = ${calc.numNetworkThreads}
 
 # ── Replication (RF=${replicationFactor}, ${partitions} partitions, ${brokers} brokers) ───────
@@ -1952,7 +1952,7 @@ receive.buffer.bytes                  = ${calc.consumerReceiveBuffer}
             <div style={{display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(240px,1fr))", gap:10}}>
               {[
                 {param:"num.network.threads",     dflt:"3",     rec:`${calc.numNetworkThreads}`, color:P.accent,
-                 note:`Handles all I/O: ${calc.perBrokerTotalConns} total connections (${calc.perBrokerProducerConns} prod + ${calc.perBrokerConsumerConns} cons + ${calc.perBrokerReplicaFetcherConnsIn + calc.perBrokerReplicaFetcherConnsOut} repl). Rule: 1 thread per ~50 connections, min 8.`},
+                 note:`Handles all I/O: ${calc.perBrokerTotalConns} total connections (${calc.perBrokerProducerConns} prod + ${calc.perBrokerConsumerConns} cons + ${calc.perBrokerReplicaFetcherConnsIn + calc.perBrokerReplicaFetcherConnsOut} repl). Rule: 1 per ~50 conns OR min (${brokers}-1)×${calc.numReplicaFetchers}+1 for repl+clients.`},
                 {param:"replica.fetch.max.bytes", dflt:"1 MB", rec:fmtBytes(calc.replicaFetchMaxBytes), color:P.purple,
                  note:`Should be ≥ producer batch.size (${fmtBytes(calc.batchSize)}) so replicas fetch complete batches.`},
                 {param:"num.replica.fetchers",    dflt:"1",     rec:`${calc.numReplicaFetchers}`, color:P.cyan,
