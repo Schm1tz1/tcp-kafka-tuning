@@ -45,7 +45,7 @@ A self-contained reference for diagnosing and optimising throughput across the I
 └── README.md
 ```
 
-> **Note on `docker/*/src/App.jsx`:** these are kept in sync with `dashboards/`. When updating a dashboard, copy the changed `.jsx` into both locations, or replace `docker/tcp/src/App.jsx` and `docker/kafka/src/App.jsx` with symlinks.
+**Single source of truth:** `dashboards/tcp-throughput-explainer.jsx` and `dashboards/kafka-tcp-tuning.jsx` are the only copies. The Vite projects in `docker/tcp/` and `docker/kafka/` import them directly via `main.jsx` — there are no duplicate `App.jsx` files.
 
 ---
 
@@ -161,11 +161,11 @@ For your deployments/sharing you have the following options:
 **Option A — Docker**
 
 ```bash
-# From repo root
+# From repo root (context is .. in docker-compose.yml)
 docker compose -f docker/docker-compose.yml up
 
-# Or build and run directly
-docker build -t tcp-kafka-viz docker/
+# Or build and run directly (from repo root, so Dockerfile can access dashboards/)
+docker build -f docker/Dockerfile -t tcp-kafka-viz .
 docker run -p 3001:3001 -p 3002:3002 tcp-kafka-viz
 ```
 
@@ -180,10 +180,11 @@ Both tools are compatible with the existing `Dockerfile` and `docker-compose.yml
 Podman (common on RHEL/Fedora; available via `brew install podman` on macOS):
 
 ```bash
-podman build -t tcp-kafka-viz docker/
+# Build from repository root (so Dockerfile can access dashboards/)
+podman build -f docker/Dockerfile -t tcp-kafka-viz .
 podman run -p 3001:3001 -p 3002:3002 tcp-kafka-viz
 
-# Or with the compose file
+# Or with the compose file (context is set to .. in docker-compose.yml)
 podman compose -f docker/docker-compose.yml up
 ```
 
@@ -203,7 +204,8 @@ Both are rootless by default and produce standard OCI images pushable to any reg
 Buildah builds OCI-compliant images without a Docker daemon and without root. The existing `Dockerfile` works unchanged:
 
 ```bash
-buildah bud -t tcp-kafka-viz docker/
+# Build from repo root (so Dockerfile can access dashboards/)
+buildah bud -f docker/Dockerfile -t tcp-kafka-viz .
 ```
 
 Run with Podman (which is typically paired with Buildah):
@@ -296,12 +298,14 @@ Steps 1–5 require no network infrastructure changes.
 | Scenario | Bandwidth | RTT | BDP | `batch.size` | `rmem_max` | `linger.ms` | CC |
 |---|---|---|---|---|---|---|---|
 | Kafka defaults | — | — | — | 16 KB | 256 KB | 0 | cubic |
-| Intra-datacenter | 10 Gbps | 0.2 ms | ~250 KB | 128 KB | 32 MB | 5 | bbr |
-| Same-AZ | 1 Gbps | 5 ms | ~625 KB | 128 KB | 128 MB | 10 | bbr |
-| Cross-AZ | 1 Gbps | 20 ms | ~2.5 MB | 256 KB | 256 MB | 20 | bbr |
-| Cross-region | 500 Mbps | 60 ms | ~3.75 MB | 512 KB | 512 MB | 50 | bbr |
-| Multi-region | 200 Mbps | 150 ms | ~3.75 MB | 1 MB | 1 GB | 100 | bbr |
-| Satellite | 50 Mbps | 600 ms | ~3.75 MB | 1 MB | 2 GB | 500 | bbr |
+| Local DC (Jumbo) | 10 Gbps | 0.12 ms | ~150 KB | 128 KB | 32 MB | 5 | bbr |
+| Cloud Same AZ/Zone | 10 Gbps | 0.5 ms | ~625 KB | 128 KB | 128 MB | 10 | bbr |
+| Cloud Cross-AZ | 5 Gbps | 2.5 ms | ~1.56 MB | 256 KB | 256 MB | 15 | bbr |
+| Cloud Cross-Region | 1 Gbps | 45 ms | ~5.63 MB | 512 KB | 512 MB | 50 | bbr |
+| Cloud → Internet | 500 Mbps | 30 ms | ~1.88 MB | 256 KB | 256 MB | 30 | bbr |
+| On-Prem Cross-DC | 1 Gbps | 12 ms | ~1.5 MB | 256 KB | 256 MB | 15 | bbr |
+| Multi-Region (Global) | 200 Mbps | 155 ms | ~3.88 MB | 1 MB | 1 GB | 100 | bbr |
+| Satellite | 50 Mbps | 620 ms | ~3.88 MB | 1 MB | 2 GB | 500 | bbr |
 
 Values assume `compression.type = lz4` and `acks = all`.
 

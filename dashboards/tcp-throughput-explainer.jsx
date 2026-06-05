@@ -412,9 +412,31 @@ const P = {
 
 const COLORS = [P.accent, P.green, P.yellow, P.red, P.purple];
 
+// ─── Scenarios ────────────────────────────────────────────────────────────────
+const SCENARIOS = [
+  { id:"local",             label:"Local DC (Jumbo)",       bwMbps:10000, rtt:0.12,  pktLoss:0,     mtu:9000 },
+  { id:"cloud_same_az",     label:"Cloud Same AZ/Zone",     bwMbps:10000, rtt:0.5,   pktLoss:0,     mtu:9000 },
+  { id:"cloud_cross_az",    label:"Cloud Cross-AZ",         bwMbps:5000,  rtt:2.5,   pktLoss:0,     mtu:9000 },
+  { id:"cloud_cross_region",label:"Cloud Cross-Region",     bwMbps:1000,  rtt:45,    pktLoss:0.005, mtu:9000 },
+  { id:"cloud_internet",    label:"Cloud → Internet",       bwMbps:500,   rtt:30,    pktLoss:0.01,  mtu:1500 },
+  { id:"same_az",           label:"On-Prem Same DC",        bwMbps:1000,  rtt:2,     pktLoss:0,     mtu:1500 },
+  { id:"cross_az",          label:"On-Prem Cross-DC",       bwMbps:1000,  rtt:12,    pktLoss:0,     mtu:1500 },
+  { id:"cross_region",      label:"Cross-Region WAN",       bwMbps:500,   rtt:65,    pktLoss:0.01,  mtu:1500 },
+  { id:"multi_region",      label:"Multi-Region (Global)",  bwMbps:200,   rtt:155,   pktLoss:0.02,  mtu:1500 },
+  { id:"satellite",         label:"Satellite",              bwMbps:50,    rtt:620,   pktLoss:0.1,   mtu:1500 },
+  { id:"custom",            label:"Custom",                 bwMbps:1000,  rtt:10,    pktLoss:0,     mtu:1500 },
+];
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 const fmtWin  = v => v >= 1024 ? `${(v/1024).toFixed(0)}MB` : `${v}KB`;
 const fmtMbps = v => v >= 1000 ? `${(v/1000).toFixed(v>=10000?0:1)} Gbps` : `${v.toFixed(0)} Mbps`;
+const fmtBytes = v => {
+  if (v >= 1073741824) return `${(v/1073741824).toFixed(1)} GB`;
+  if (v >= 1048576) return `${(v/1048576).toFixed(1)} MB`;
+  if (v >= 1024) return `${(v/1024).toFixed(0)} KB`;
+  return `${v} B`;
+};
+const nextPow2 = n => Math.pow(2, Math.ceil(Math.log2(n)));
 
 const Mono = ({children}) => (
   <code style={{fontFamily:"'JetBrains Mono',monospace", background:"#1c2333",
@@ -605,6 +627,25 @@ export default function App() {
   const [logWin,   setLogWin]   = useState(false);  // throughput vs window
   const [logCwnd,  setLogCwnd]  = useState(false);  // cwnd sawtooth
   const [logMath,  setLogMath]  = useState(true);   // Mathis (already log)
+
+  // Interactive tuning calculator state
+  const [tuningScenario, setTuningScenario] = useState("cloud_cross_az");
+  const [tuningBw, setTuningBw] = useState(5000);
+  const [tuningRtt, setTuningRtt] = useState(2.5);
+  const [tuningMtu, setTuningMtu] = useState(9000);
+  const [tuningLoss, setTuningLoss] = useState(0);
+
+  // Apply scenario preset
+  const applyTuningScenario = (id) => {
+    setTuningScenario(id);
+    const s = SCENARIOS.find(x => x.id === id);
+    if (s) {
+      setTuningBw(s.bwMbps);
+      setTuningRtt(s.rtt);
+      setTuningMtu(s.mtu);
+      setTuningLoss(s.pktLoss);
+    }
+  };
 
   return (
     <div style={{background:P.bg, color:P.text, minHeight:"100vh",
@@ -850,6 +891,182 @@ export default function App() {
         </div>
       </div>
 
+      {/* ── 4.5. MTU and Maximum Segment Size ───────────────────────────── */}
+      <SectionHeading num="4.5" title="MTU, MSS, and Path Fragmentation" />
+
+      <p style={{color:P.muted, lineHeight:1.7, fontSize:"0.93em", maxWidth:760}}>
+        The <strong style={{color:P.text}}>Maximum Transmission Unit (MTU)</strong> is the largest IP packet size
+        (in bytes) that can traverse a link without fragmentation. The TCP <strong style={{color:P.text}}>Maximum
+        Segment Size (MSS)</strong> is derived as:
+      </p>
+
+      <Formula style={{margin:"20px 0", maxWidth:760}}>
+        MSS = MTU − 40 bytes&nbsp;&nbsp;(20-byte IP header + 20-byte TCP header)
+      </Formula>
+
+      <p style={{color:P.muted, lineHeight:1.7, fontSize:"0.93em", maxWidth:760}}>
+        Standard Ethernet uses MTU 1500, yielding MSS 1460. Cloud providers support
+        <strong style={{color:P.accent}}> jumbo frames</strong> (MTU 9000) on intra-VPC paths, reducing header
+        overhead from 2.7% to 0.4% and decreasing interrupt rate by 6×.
+      </p>
+
+      {/* MTU Impact Chart */}
+      <div style={{marginTop:20, marginBottom:20, maxWidth:780}}>
+        <div style={{background:P.panel,border:`1px solid ${P.border}`,borderRadius:10,padding:16}}>
+          <Label c={P.muted} style={{display:"block", marginBottom:12}}>
+            MTU Impact on Packet Efficiency
+          </Label>
+          <ResponsiveContainer width="100%" height={240}>
+            <BarChart data={(() => {
+              const mtus = [576, 1280, 1500, 4352, 9000];
+              return mtus.map(mtu => {
+                const mss = mtu - 40;
+                const headerOverhead = parseFloat((40 / mtu * 100).toFixed(1));
+                const packetsPerMB = Math.ceil(1048576 / mss);
+                return {
+                  mtu: `MTU ${mtu}`,
+                  mss,
+                  headerOverhead,
+                  packetsPerMB
+                };
+              });
+            })()}>
+              <CartesianGrid strokeDasharray="3 3" stroke={P.border} />
+              <XAxis dataKey="mtu" stroke={P.muted} tick={{fontSize:10}}
+                label={{value:"MTU (bytes)", position:"insideBottom", dy:10, fill:P.muted, fontSize:11}} />
+              <YAxis yAxisId="left" stroke={P.red} tick={{fontSize:10}}
+                label={{value:"Header Overhead %", angle:-90, position:"insideLeft", dx:-8, fill:P.red, fontSize:11}} />
+              <YAxis yAxisId="right" orientation="right" stroke={P.green} tick={{fontSize:10}}
+                label={{value:"Packets per MB", angle:90, position:"insideRight", dx:8, fill:P.green, fontSize:11}} />
+              <Tooltip contentStyle={{background:P.panel, border:`1px solid ${P.border}`, borderRadius:6, fontSize:"0.85em"}}
+                separator=""
+                formatter={(value, name, props) => {
+                  if (name === "headerOverhead") {
+                    return [
+                      <div key="overhead">
+                        <div style={{color:P.red, fontWeight:600}}>{value}% header overhead</div>
+                        <div style={{fontSize:"0.9em", marginTop:4, opacity:0.8}}>
+                          MSS {props.payload.mss} bytes
+                        </div>
+                      </div>,
+                      ""
+                    ];
+                  }
+                  if (name === "packetsPerMB") {
+                    return [
+                      <div key="packets">
+                        <div style={{color:P.green, fontWeight:600}}>{value.toLocaleString()} packets/MB</div>
+                        <div style={{fontSize:"0.9em", marginTop:4, opacity:0.8}}>
+                          MSS {props.payload.mss} bytes
+                        </div>
+                      </div>,
+                      ""
+                    ];
+                  }
+                  return [value, name];
+                }} />
+              <Bar yAxisId="left" dataKey="headerOverhead" fill={P.red} name="headerOverhead" />
+              <Bar yAxisId="right" dataKey="packetsPerMB" fill={P.green} name="packetsPerMB" />
+            </BarChart>
+          </ResponsiveContainer>
+
+          <div style={{marginTop:16, padding:12, background:P.panel2, borderRadius:6, fontSize:"0.85em"}}>
+            <strong style={{color:P.accent}}>Cloud Provider MTU Limits:</strong>
+            <ul style={{margin:"8px 0 0 20px", lineHeight:1.7, color:P.muted}}>
+              <li><strong>AWS:</strong> MTU 9001 (VPC), 1500 (internet gateway egress)</li>
+              <li><strong>GCP:</strong> MTU 8896 (VPC), 1460 (external IP egress)</li>
+              <li><strong>Azure:</strong> MTU 9000 (VNet), 1400 (internet egress, VXLAN overhead)</li>
+            </ul>
+            <p style={{margin:"12px 0 0 0", color:P.yellow}}>
+              ⚠ Jumbo frames work <em>only</em> on intra-VPC paths. Internet-bound traffic must use standard MTU.
+            </p>
+          </div>
+        </div>
+
+        {/* PMTUD Section */}
+        <div style={{marginTop:16, background:P.panel, border:`1px solid ${P.border}`, borderRadius:10, padding:16}}>
+          <Label c={P.muted}>Path MTU Discovery (PMTUD)</Label>
+          <p style={{color:P.muted, fontSize:"0.9em", marginTop:8, lineHeight:1.7}}>
+            TCP relies on ICMP "Fragmentation Needed" (Type 3, Code 4) messages to discover
+            the path MTU. If intermediate firewalls block ICMP, the sender never learns to
+            reduce MSS — creating a <strong style={{color:P.red}}>PMTUD black hole</strong>: handshakes succeed
+            (small packets pass) but bulk transfers stall (large segments silently drop).
+          </p>
+          <div style={{marginTop:12, padding:10, background:P.bg, borderLeft:`3px solid ${P.cyan}`, fontFamily:"monospace", fontSize:"0.8em", lineHeight:1.6}}>
+            # Diagnose path MTU to broker<br/>
+            tracepath broker.example.com<br/><br/>
+            # Force MSS clamp on tunnel interface (Linux)<br/>
+            iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN \<br/>
+            &nbsp;&nbsp;-j TCPMSS --clamp-mss-to-pmtu
+          </div>
+        </div>
+
+        {/* Fragmentation Loss Amplification */}
+        <div style={{marginTop:16, background:P.panel, border:`1px solid ${P.border}`, borderRadius:10, padding:16}}>
+          <Label c={P.muted}>Fragmentation Loss Amplification</Label>
+          <p style={{color:P.muted, fontSize:"0.9em", marginTop:8, lineHeight:1.7}}>
+            When a packet exceeds the path MTU and fragments into <em>N</em> fragments,
+            losing <strong style={{color:P.red}}>any single fragment</strong> forces retransmission
+            of the <em>entire original packet</em>. This creates a multiplicative loss effect:
+          </p>
+
+          <Formula style={{margin:"16px 0", fontSize:"0.9em"}}>
+            P<sub>effective</sub> = 1 − (1 − p)<sup>N</sup>
+            &nbsp;&nbsp;&nbsp;&nbsp;where N = ⌈packet_size / path_MTU⌉
+          </Formula>
+
+          <p style={{color:P.muted, fontSize:"0.9em", lineHeight:1.7, marginBottom:12}}>
+            Example: A 9000-byte packet fragments into 7 pieces at MTU 1500. With 1% per-fragment loss,
+            effective packet loss becomes <strong style={{color:P.red}}>6.8%</strong> — a 6.8× amplification.
+            Combined with the Mathis equation, this can reduce throughput by 2.6×.
+          </p>
+
+          <ResponsiveContainer width="100%" height={220}>
+            <LineChart data={(() => {
+              const losses = [0.001, 0.005, 0.01, 0.02, 0.05];
+              const fragmentCounts = [1, 2, 3, 5, 7, 10];
+              return losses.map(p => {
+                const row = { loss: (p * 100).toFixed(2) + '%' };
+                fragmentCounts.forEach(n => {
+                  const effLoss = 1 - Math.pow(1 - p, n);
+                  row[`n${n}`] = parseFloat((effLoss * 100).toFixed(2));
+                });
+                return row;
+              });
+            })()} margin={{top:4,right:20,bottom:22,left:50}}>
+              <CartesianGrid strokeDasharray="3 3" stroke={P.border} />
+              <XAxis dataKey="loss" stroke={P.muted} tick={{fontSize:10}}
+                label={{value:"Per-Fragment Loss Rate", position:"insideBottom", dy:10, fill:P.muted, fontSize:11}} />
+              <YAxis stroke={P.muted} tick={{fontSize:10}}
+                label={{value:"Effective Packet Loss %", angle:-90, position:"insideLeft", dx:-10, fill:P.muted, fontSize:11}} />
+              <Tooltip contentStyle={{background:P.panel, border:`1px solid ${P.border}`, borderRadius:6, fontSize:"0.85em"}}
+                formatter={(value) => `${value}%`} />
+              <Legend wrapperStyle={{fontSize:"0.8em"}} />
+              <Line type="monotone" dataKey="n1" stroke={P.green} name="No fragmentation" strokeWidth={2} dot={false} />
+              <Line type="monotone" dataKey="n2" stroke={P.cyan} name="2 fragments" strokeWidth={2} dot={false} />
+              <Line type="monotone" dataKey="n3" stroke={P.blue} name="3 fragments" strokeWidth={2} dot={false} />
+              <Line type="monotone" dataKey="n7" stroke={P.yellow} name="7 fragments (9KB@1500)" strokeWidth={2} dot={false} />
+              <Line type="monotone" dataKey="n10" stroke={P.red} name="10 fragments" strokeWidth={2} dot={false} />
+            </LineChart>
+          </ResponsiveContainer>
+
+          <div style={{marginTop:12, padding:10, background:P.bg, borderLeft:`3px solid ${P.red}`, fontSize:"0.85em", lineHeight:1.6}}>
+            <strong style={{color:P.red}}>Why fragmentation + loss is catastrophic:</strong>
+            <ul style={{margin:"8px 0 0 20px", color:P.muted}}>
+              <li>With 7 fragments and 1% loss: effective loss 6.8% → Mathis throughput drops 2.6×</li>
+              <li>Reassembly timeout adds latency variance (typical timeout: 30-60 seconds)</li>
+              <li>Out-of-order fragments trigger TCP retransmit timers unnecessarily</li>
+              <li>Firewall stateful tracking often drops fragmented packets entirely</li>
+            </ul>
+            <p style={{margin:"12px 0 0 0", color:P.accent}}>
+              <strong>Solution:</strong> Use PMTUD or MSS clamping to prevent fragmentation.
+              In Kafka: verify path MTU with <code style={{background:P.panel, padding:"2px 6px", borderRadius:3}}>tracepath</code> before
+              enabling jumbo frames.
+            </p>
+          </div>
+        </div>
+      </div>
+
       {/* ── 5. Mathis Equation ────────────────────────────────────────────── */}
       <SectionHeading num="5" title="Packet Loss — The Mathis Equation" />
 
@@ -905,13 +1122,16 @@ export default function App() {
           </thead>
           <tbody>
             {[
-              ["50GbE DC", "50 Gbps", "2 ms", "12.5 MB", "0.5%", "Huge buffers + BBR + FQ qdisc"],
-              ["LAN", "1 Gbps", "0.5 ms", "62 KB", "~100%", "No change needed"],
-              ["Office WAN", "100 Mbps", "20 ms", "250 KB", "26%", "Tune buffers"],
-              ["Datacenter", "10 Gbps", "5 ms", "6.25 MB", "1%", "Large buffers + CUBIC/BBR"],
-              ["Trans-Pacific", "1 Gbps", "180 ms", "22.5 MB", "0.3%", "Large buffers, Window Scale"],
-              ["Satellite", "50 Mbps", "600 ms", "3.75 MB", "1.7%", "Performance Enhancing Proxy"],
-              ["VPN / WireGuard", "500 Mbps", "15 ms", "937 KB", "7%", "Increase socket buffers"],
+              ["Local DC (Jumbo)", "10 Gbps", "0.12 ms", "150 KB", "43%", "Jumbo frames (MTU 9000) + BBR"],
+              ["Cloud Same AZ/Zone", "10 Gbps", "0.5 ms", "625 KB", "10%", "Jumbo frames + large buffers"],
+              ["Cloud Cross-AZ", "5 Gbps", "2.5 ms", "1.56 MB", "4%", "Jumbo frames + BBR + buffers"],
+              ["Cloud Cross-Region", "1 Gbps", "45 ms", "5.63 MB", "1.1%", "Large buffers + BBR + Window Scale"],
+              ["Cloud → Internet", "500 Mbps", "30 ms", "1.88 MB", "3.4%", "Standard MTU + buffer tuning"],
+              ["On-Prem Same DC", "1 Gbps", "2 ms", "250 KB", "26%", "Tune buffers"],
+              ["On-Prem Cross-DC", "1 Gbps", "12 ms", "1.5 MB", "4.3%", "Large buffers + CUBIC/BBR"],
+              ["Cross-Region WAN", "500 Mbps", "65 ms", "4.06 MB", "1.6%", "Large buffers + Window Scale"],
+              ["Multi-Region (Global)", "200 Mbps", "155 ms", "3.88 MB", "1.7%", "Large buffers + BBR + compression"],
+              ["Satellite", "50 Mbps", "620 ms", "3.88 MB", "1.7%", "Performance Enhancing Proxy + buffers"],
             ].map(([s,bw,rtt,bdp,u,a],i) => (
               <tr key={s} style={{background: i%2===0 ? "transparent" : "#161b22",
                 borderBottom:`1px solid ${P.border}`}}>
@@ -927,27 +1147,158 @@ export default function App() {
         </table>
       </div>
 
-      {/* ── 7. Linux tuning ───────────────────────────────────────────────── */}
-      <SectionHeading num="7" title="Linux Tuning Cheatsheet" />
+      {/* ── 7. Interactive Linux Tuning Calculator ─────────────────────────── */}
+      <SectionHeading num="7" title="Interactive Linux Tuning Calculator" />
 
-      <div style={{background:"#0d1117", border:`1px solid #30363d`, borderRadius:8,
-        padding:"16px 20px", margin:"8px 0", fontFamily:"'JetBrains Mono',monospace",
-        fontSize:"0.8em", lineHeight:1.8, overflowX:"auto"}}>
-        <div style={{color:P.muted}}># BDP = bandwidth × RTT / 8</div>
-        <div style={{color:P.muted}}># e.g. 50 Gbps × 10 ms = 62.5 MB → round up to 128 MB</div>
-        <br/>
-        <div><span style={{color:P.green}}>sysctl</span>{" "}<span style={{color:P.text}}>-w net.core.rmem_max=134217728</span></div>
-        <div><span style={{color:P.green}}>sysctl</span>{" "}<span style={{color:P.text}}>-w net.core.wmem_max=134217728</span></div>
-        <div><span style={{color:P.green}}>sysctl</span>{" "}<span style={{color:P.text}}>-w net.ipv4.tcp_rmem=<span style={{color:P.yellow}}>"4096 1048576 134217728"</span></span></div>
-        <div><span style={{color:P.green}}>sysctl</span>{" "}<span style={{color:P.text}}>-w net.ipv4.tcp_wmem=<span style={{color:P.yellow}}>"4096 1048576 134217728"</span></span></div>
-        <br/>
-        <div style={{color:P.muted}}># Verify window scaling in use:</div>
-        <div><span style={{color:P.green}}>ss</span>{" "}<span style={{color:P.text}}>-timn | grep wscale</span></div>
-        <br/>
-        <div style={{color:P.muted}}># Modern congestion control (BBR recommended on high-BDP paths)</div>
-        <div><span style={{color:P.green}}>sysctl</span>{" "}<span style={{color:P.text}}>-w net.ipv4.tcp_congestion_control=<span style={{color:P.yellow}}>bbr</span></span></div>
-        <div><span style={{color:P.green}}>sysctl</span>{" "}<span style={{color:P.text}}>-w net.core.default_qdisc=<span style={{color:P.yellow}}>fq</span></span></div>
-      </div>
+      {(() => {
+        // Calculate tuning parameters
+        const bdpBytes = (tuningBw * 1e6 / 8) * (tuningRtt / 1000);
+        const bufCeil = nextPow2(bdpBytes * 2); // 2× BDP for headroom
+        const mss = tuningMtu - 40;
+        const mathisMbps = tuningLoss > 0
+          ? (mss / ((tuningRtt / 1000) * Math.sqrt(tuningLoss / 100))) / 125000
+          : null;
+        const effectiveBw = mathisMbps ? Math.min(tuningBw, mathisMbps) : tuningBw;
+        const windowSizeKB = bdpBytes / 1024;
+
+        return (
+          <div style={{display:"grid", gap:16}}>
+            {/* Scenario selector */}
+            <div style={{background:P.panel, border:`1px solid ${P.border}`, borderRadius:8, padding:16}}>
+              <div style={{color:P.muted, fontSize:"0.78em", fontWeight:600, letterSpacing:"0.08em",
+                textTransform:"uppercase", marginBottom:10}}>Scenario Preset</div>
+              <select
+                value={tuningScenario}
+                onChange={(e) => applyTuningScenario(e.target.value)}
+                style={{
+                  width:"100%", background:P.bg, border:`1px solid ${P.border}`,
+                  borderRadius:6, padding:"10px 12px", color:P.text, fontSize:"0.9em",
+                  fontWeight:600, cursor:"pointer"
+                }}>
+                {SCENARIOS.map(s => (
+                  <option key={s.id} value={s.id}>{s.label}</option>
+                ))}
+              </select>
+            </div>
+
+            {/* Parameter sliders */}
+            <div style={{background:P.panel, border:`1px solid ${P.border}`, borderRadius:8, padding:16,
+              display:"grid", gap:12}}>
+              <SliderField label="Bandwidth" val={tuningBw} set={setTuningBw}
+                min={10} max={50000} step={tuningBw >= 10000 ? 100 : tuningBw >= 1000 ? 10 : 1}
+                fmt={v => fmtMbps(v)} color={P.accent} />
+              <SliderField label="RTT (Round-Trip Time)" val={tuningRtt} set={setTuningRtt}
+                min={0.1} max={1000} step={tuningRtt >= 100 ? 10 : tuningRtt >= 10 ? 1 : 0.1}
+                fmt={v => `${v.toFixed(v < 1 ? 2 : v < 10 ? 1 : 0)} ms`} color={P.green} />
+              <SliderField label="MTU (Maximum Transmission Unit)" val={tuningMtu} set={setTuningMtu}
+                min={576} max={9000} step={100}
+                fmt={v => `${v} bytes (MSS: ${v-40})`} color={P.yellow} />
+              <SliderField label="Packet Loss" val={tuningLoss} set={setTuningLoss}
+                min={0} max={5} step={0.01}
+                fmt={v => `${v.toFixed(2)}%`} color={P.red} />
+            </div>
+
+            {/* Calculated metrics */}
+            <div style={{background:P.panel, border:`1px solid ${P.border}`, borderRadius:8, padding:16}}>
+              <div style={{color:P.muted, fontSize:"0.78em", fontWeight:600, letterSpacing:"0.08em",
+                textTransform:"uppercase", marginBottom:12}}>Calculated Parameters</div>
+              <div style={{display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(140px, 1fr))", gap:12}}>
+                <div style={{background:P.bg, borderRadius:6, padding:"10px 12px"}}>
+                  <div style={{color:P.muted, fontSize:"0.7em", marginBottom:4}}>BDP</div>
+                  <div style={{color:P.accent, fontFamily:"monospace", fontWeight:700, fontSize:"1.1em"}}>
+                    {fmtBytes(bdpBytes)}
+                  </div>
+                </div>
+                <div style={{background:P.bg, borderRadius:6, padding:"10px 12px"}}>
+                  <div style={{color:P.muted, fontSize:"0.7em", marginBottom:4}}>Buffer Ceiling</div>
+                  <div style={{color:P.green, fontFamily:"monospace", fontWeight:700, fontSize:"1.1em"}}>
+                    {fmtBytes(bufCeil)}
+                  </div>
+                </div>
+                <div style={{background:P.bg, borderRadius:6, padding:"10px 12px"}}>
+                  <div style={{color:P.muted, fontSize:"0.7em", marginBottom:4}}>MSS</div>
+                  <div style={{color:P.yellow, fontFamily:"monospace", fontWeight:700, fontSize:"1.1em"}}>
+                    {mss} bytes
+                  </div>
+                </div>
+                {mathisMbps && (
+                  <div style={{background:P.bg, borderRadius:6, padding:"10px 12px"}}>
+                    <div style={{color:P.muted, fontSize:"0.7em", marginBottom:4}}>Loss Limit (Mathis)</div>
+                    <div style={{color:P.red, fontFamily:"monospace", fontWeight:700, fontSize:"1.1em"}}>
+                      {fmtMbps(mathisMbps)}
+                    </div>
+                  </div>
+                )}
+                <div style={{background:P.bg, borderRadius:6, padding:"10px 12px"}}>
+                  <div style={{color:P.muted, fontSize:"0.7em", marginBottom:4}}>Window Size (64KB util)</div>
+                  <div style={{color:P.purple, fontFamily:"monospace", fontWeight:700, fontSize:"1.1em"}}>
+                    {Math.round(65536 / bdpBytes * 100)}%
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Generated sysctl config */}
+            <div style={{background:"#0d1117", border:`1px solid #30363d`, borderRadius:8,
+              padding:"16px 20px", fontFamily:"'JetBrains Mono',monospace",
+              fontSize:"0.8em", lineHeight:1.8, overflowX:"auto"}}>
+              <div style={{color:P.muted}}># BDP = {fmtMbps(tuningBw)} × {tuningRtt} ms / 8 = {fmtBytes(bdpBytes)}</div>
+              <div style={{color:P.muted}}># Buffer ceiling (2× BDP, rounded to power of 2): {fmtBytes(bufCeil)}</div>
+              <br/>
+              <div><span style={{color:P.green}}>sysctl</span>{" "}<span style={{color:P.text}}>-w net.core.rmem_max={bufCeil}</span></div>
+              <div><span style={{color:P.green}}>sysctl</span>{" "}<span style={{color:P.text}}>-w net.core.wmem_max={bufCeil}</span></div>
+              <div><span style={{color:P.green}}>sysctl</span>{" "}<span style={{color:P.text}}>-w net.ipv4.tcp_rmem=<span style={{color:P.yellow}}>"4096 {Math.round(bufCeil/2)} {bufCeil}"</span></span></div>
+              <div><span style={{color:P.green}}>sysctl</span>{" "}<span style={{color:P.text}}>-w net.ipv4.tcp_wmem=<span style={{color:P.yellow}}>"4096 {Math.round(bufCeil/2)} {bufCeil}"</span></span></div>
+              <br/>
+              <div style={{color:P.muted}}># Verify window scaling in use:</div>
+              <div><span style={{color:P.green}}>ss</span>{" "}<span style={{color:P.text}}>-timn | grep wscale</span></div>
+              <br/>
+              <div style={{color:P.muted}}># Congestion control ({bdpBytes > 1e6 ? "BBR recommended for high-BDP" : "CUBIC adequate for low-BDP"})</div>
+              <div><span style={{color:P.green}}>sysctl</span>{" "}<span style={{color:P.text}}>-w net.ipv4.tcp_congestion_control=<span style={{color:P.yellow}}>{bdpBytes > 1e6 ? "bbr" : "cubic"}</span></span></div>
+              {bdpBytes > 1e6 && (
+                <div><span style={{color:P.green}}>sysctl</span>{" "}<span style={{color:P.text}}>-w net.core.default_qdisc=<span style={{color:P.yellow}}>fq</span></span></div>
+              )}
+              {tuningMtu === 9000 && (
+                <>
+                  <br/>
+                  <div style={{color:P.muted}}># Jumbo frames (MTU 9000) - verify path supports it:</div>
+                  <div><span style={{color:P.green}}>ip</span>{" "}<span style={{color:P.text}}>link set dev eth0 mtu 9000</span></div>
+                  <div><span style={{color:P.green}}>tracepath</span>{" "}<span style={{color:P.text}}>target.example.com</span></div>
+                </>
+              )}
+            </div>
+
+            {/* Diagnostics */}
+            {mathisMbps && mathisMbps < tuningBw && (
+              <div style={{background:"#2d1a1a", border:`1px solid ${P.red}44`, borderRadius:8,
+                padding:12, fontSize:"0.85em", color:P.red}}>
+                ⚠ <strong>Packet loss ({tuningLoss}%) limits throughput to {fmtMbps(mathisMbps)}</strong> despite {fmtMbps(tuningBw)} link.
+                Fix network issues before tuning buffers.
+              </div>
+            )}
+            {bdpBytes < 65536 && (
+              <div style={{background:"#1a2d1a", border:`1px solid ${P.green}44`, borderRadius:8,
+                padding:12, fontSize:"0.85em", color:P.green}}>
+                ✓ Default buffers (64 KB) sufficient for this path ({Math.round(65536/bdpBytes)}× BDP).
+                No tuning needed.
+              </div>
+            )}
+            {bdpBytes >= 65536 && bdpBytes < 1e6 && (
+              <div style={{background:"#2d2a1a", border:`1px solid ${P.yellow}44`, borderRadius:8,
+                padding:12, fontSize:"0.85em", color:P.yellow}}>
+                ⚠ BDP ({fmtBytes(bdpBytes)}) exceeds default 64 KB buffers. Buffer tuning recommended.
+              </div>
+            )}
+            {bdpBytes >= 1e6 && (
+              <div style={{background:"#2d2a1a", border:`1px solid ${P.yellow}44`, borderRadius:8,
+                padding:12, fontSize:"0.85em", color:P.yellow}}>
+                ⚠ High-BDP path ({fmtBytes(bdpBytes)}). Large buffers + BBR + Window Scale (RFC 1323) required.
+                Default Linux settings will severely limit throughput.
+              </div>
+            )}
+          </div>
+        );
+      })()}
 
       {/* ── 8. BBR vs CUBIC ──────────────────────────────────────────────── */}
       <SectionHeading num="8" title="BBR vs CUBIC — Congestion Control Comparison" />

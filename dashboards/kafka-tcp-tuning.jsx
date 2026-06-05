@@ -2,7 +2,7 @@ import { useState, useCallback } from "react";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, ReferenceLine, Legend, AreaChart, Area,
-  BarChart, Bar,
+  BarChart, Bar, Cell,
 } from "recharts";
 
 // ── Palette ──────────────────────────────────────────────────────────────────
@@ -76,7 +76,14 @@ const nearestBatch = n => BATCH_STEPS.find(b=>b>=n) || BATCH_STEPS[BATCH_STEPS.l
 // F10 W_eff = batch×inflight  Apache Kafka Producer docs (application of F1)
 // F11 linger_t = W×8/B       Derived from F1 — batch drain time
 // F12 linger_l = SLA−RTT−t_b  End-to-end latency budget decomposition
-function calcFromMeasurements({bwMbps, rttMin, rttAvg, plateauKB, conns, mtu, inflight, latencyBudgetMs, pktLoss, partitions, compressionRatio}) {
+// F13 Consumer fetch window per partition = max.partition.fetch.bytes
+// F14 fetch.max.wait.ms tradeoff: latency vs batching (symmetric to F11)
+// F15 Replica lag timeout = RTT×4 + fetch.max.wait.ms + 5000ms margin
+// F16 num.replica.fetchers = ceil(partitions / 4) — one fetcher per ~4 partitions
+// F17 replica.fetch.max.bytes ≥ producer batch.size for full-batch replication
+// F18 Effective bandwidth per broker = bw / (1 + (RF-1) × 2) — accounts for replication I/O
+// F19 Per-broker bandwidth budget: producer_in + consumer_out + replication_in + replication_out ≤ BW_limit
+function calcFromMeasurements({bwMbps, rttMin, rttAvg, plateauKB, conns, mtu, inflight, latencyBudgetMs, pktLoss, partitions, compressionRatio, replicationFactor=3, brokers=3, producerCount=3, consumerCount=2, expectedThroughputPct=70, expectedThroughputMbps=100, throughputMode='percent'}) {
   const bwBytes   = bwMbps * 1e6 / 8;
   const rttSMin   = rttMin / 1000;
   const rttSAvg   = rttAvg / 1000;
@@ -133,12 +140,161 @@ function calcFromMeasurements({bwMbps, rttMin, rttAvg, plateauKB, conns, mtu, in
     logicalMbps: Math.round(effectiveLogicalMbps / p * 10) / 10,
   }));
 
+  // ── Consumer configuration (F13, F14) ──────────────────────────────────────
+  // Consumer fetch window should be >= producer batch size to avoid stalls.
+  // Each partition is fetched independently, so max.partition.fetch.bytes sets
+  // the per-partition receive window.
+  const consumerFetchMaxBytes = Math.max(batchSize, 1048576); // min 1MB
+
+  // fetch.min.bytes controls batching on the consumer side. Higher = more batching,
+  // less CPU, but higher latency. Set to half of batch size as a starting point.
+  const consumerFetchMinBytes = Math.max(1, Math.round(batchSize / 2));
+
+  // fetch.max.wait.ms (F14): time broker waits to accumulate fetch.min.bytes.
+  // For throughput: match linger.ms from producer. For latency: minimize (100-500ms).
+  const consumerFetchMaxWaitThru = lingerThru;
+  const consumerFetchMaxWaitLat  = Math.min(500, Math.max(100, Math.round(latencyBudgetMs * 0.3)));
+
+  // Consumer receive.buffer.bytes should be >= BDP, same reasoning as producer send buffer
+  const consumerReceiveBuffer = bufCeil;
+
+  // ── Broker replication configuration (F15, F16, F17) ───────────────────────
+  // replica.fetch.max.bytes should be >= producer batch.size so replicas can fetch
+  // complete batches in one request. Larger = fewer fetch requests but more memory.
+  const replicaFetchMaxBytes = Math.max(batchSize, 1048576);
+
+  // num.replica.fetchers: one fetcher thread can handle ~4-8 partitions efficiently.
+  // More fetchers = higher parallelism but more broker connections and threads.
+  const numReplicaFetchers = Math.max(1, Math.ceil(partitions / 6));
+
+  // replica.lag.time.max.ms (F15): timeout before a replica is considered out-of-sync.
+  // Must account for: fetch round-trip (RTT×2), broker processing, fetch.max.wait.ms,
+  // plus safety margin for GC pauses and network variance.
+  // Formula: RTT × 4 (2 round-trips with headroom) + fetch.max.wait.ms + 5000ms margin
+  const replicaLagTimeoutMs = Math.max(10000,
+    Math.round(rttAvg * 4 + consumerFetchMaxWaitThru + 5000));
+
+  // replica.socket.receive.buffer.bytes — followers fetch from leaders, need >= BDP
+  const replicaSocketReceiveBuffer = bufCeil;
+
+  // ── Per-broker bandwidth analysis (F18, F19) ───────────────────────────────
+  // CRITICAL: bwMbps is "per-broker NIC bandwidth limit", not total cluster
+  // Each broker node must handle: producer writes, consumer reads, replication IN+OUT
+
+  // Expected producer throughput (not link capacity)
+  // Can be specified as percentage of link capacity OR as absolute Mbps
+  const expectedProducerMbps = throughputMode === 'percent'
+    ? effectiveMbps * (expectedThroughputPct / 100)
+    : expectedThroughputMbps;
+
+  // Partition distribution (assuming even distribution)
+  const partitionsPerBroker = Math.ceil(partitions / brokers);
+  // Each broker is leader for ~partitionsPerBroker partitions
+  const leaderPartitionsPerBroker = partitionsPerBroker;
+  // Each broker is follower for remaining partitions
+  // With RF replicas, each partition has (RF-1) followers distributed across remaining brokers
+  const followerPartitionsPerBroker = Math.ceil(partitions * (replicationFactor - 1) / brokers);
+
+  // Effective replication bandwidth multiplier (F18):
+  // At RF=3: each 1 MB write → 1 MB to leader + 2 MB replication = 3× amplification
+  // Leader node bandwidth breakdown:
+  //   - Producer ingress: expected producer throughput
+  //   - Replication OUT (leader → followers): producer_throughput × (RF-1)
+  //   - Replication IN (as follower for other partitions): depends on partition distribution
+  //   - Consumer egress: consumer read throughput
+
+  // Per-broker producer ingress (writes to this broker's leader partitions)
+  const perBrokerProducerIngressMbps = expectedProducerMbps * (leaderPartitionsPerBroker / partitions);
+
+  // Per-broker replication OUT (this broker as leader → followers)
+  // Each write is replicated (RF-1) times
+  const perBrokerReplicationOutMbps = perBrokerProducerIngressMbps * (replicationFactor - 1);
+
+  // Per-broker replication IN (this broker as follower ← other leaders)
+  // Follower fetches data for followerPartitionsPerBroker partitions at producer write rate
+  const perBrokerReplicationInMbps = expectedProducerMbps * (followerPartitionsPerBroker / partitions);
+
+  // Per-broker consumer egress (reads from this broker's leader partitions)
+  // Assume read rate matches write rate (typical steady-state)
+  const perBrokerConsumerEgressMbps = perBrokerProducerIngressMbps;
+
+  // Total per-broker bandwidth usage
+  const perBrokerTotalMbps = perBrokerProducerIngressMbps +
+                              perBrokerReplicationOutMbps +
+                              perBrokerReplicationInMbps +
+                              perBrokerConsumerEgressMbps;
+
+  // Per-broker utilization percentage
+  const perBrokerUtilization = Math.round((perBrokerTotalMbps / bwMbps) * 100);
+
+  // Per-broker connection count
+  // Producer connections: each producer connects to brokers hosting its partitions
+  // Assuming producers are evenly distributed and sticky partitioner
+  const perBrokerProducerConns = Math.ceil(producerCount * (leaderPartitionsPerBroker / partitions));
+
+  // Consumer connections: each consumer connects to brokers hosting partitions it consumes
+  // With partition assignment, each consumer connects to subset of brokers
+  const perBrokerConsumerConns = Math.min(consumerCount, Math.ceil(consumerCount * (leaderPartitionsPerBroker / partitions)));
+
+  // Replica fetcher connections IN (followers fetching from this broker's leaders)
+  // Each follower partition creates 1 connection to the leader
+  const perBrokerReplicaFetcherConnsIn = leaderPartitionsPerBroker * (replicationFactor - 1);
+
+  // Replica fetcher connections OUT (this broker fetching as follower)
+  // num.replica.fetchers threads, each handles ~6 partitions (F16)
+  const perBrokerReplicaFetcherConnsOut = Math.ceil(followerPartitionsPerBroker / 6);
+
+  const perBrokerTotalConns = perBrokerProducerConns + perBrokerConsumerConns +
+                               perBrokerReplicaFetcherConnsIn + perBrokerReplicaFetcherConnsOut;
+
+  // Total replication bandwidth (cluster-wide, for reference)
+  const totalReplicaConnections = partitions * (replicationFactor - 1);
+  const replicationWireMbps = expectedProducerMbps * (replicationFactor - 1);
+
+  // Bottleneck analysis
+  const bottleneck = perBrokerUtilization > 100 ? "per-broker NIC limit" :
+                      mathisMbps ? "packet loss (Mathis)" :
+                      kafkaWindowMbps < bwMbps ? "Kafka window" :
+                      "link bandwidth";
+
+  // ── MTU/MSS-derived metrics ────────────────────────────────────────────────
+  // Number of TCP segments per Kafka batch (used for header overhead calculation)
+  const segmentsPerBatch = Math.ceil(batchSize / mss);
+
+  // Kafka protocol overhead per batch: RecordBatch header (61 bytes) + per-Record overhead (14 bytes/record)
+  // Simplified: assume one segment ≈ one record for estimation
+  const kafkaOverheadPerBatch = segmentsPerBatch * 75; // 61 + 14 bytes
+
+  // Effective payload ratio after Kafka headers (what % of batch is actual application data)
+  const effectivePayloadRatio = (batchSize - kafkaOverheadPerBatch) / batchSize;
+
+  // Packets needed to transmit 1 MB at current MSS
+  const packetsPerMB = Math.ceil(1048576 / mss);
+
+  // TCP/IP header overhead percentage (40 bytes per packet)
+  const headerOverheadPct = (40 / mtu) * 100;
+
   return {empiricalBDP, theoreticalBDP, mss, bufCeil, batchSize, batchMin,
           lingerThru, lingerLatency, mathisMbps,
           kafkaWireMbps, kafkaLogicalMbps, kafkaWindowMbps,
-          effectiveMbps, effectiveLogicalMbps,
+          effectiveMbps, effectiveLogicalMbps, expectedProducerMbps,
           perPartWireMbps, perPartLogicalMbps, perPartWindowBytes, perPartBdpPct,
-          partitionSeries};
+          partitionSeries,
+          // Consumer settings
+          consumerFetchMaxBytes, consumerFetchMinBytes,
+          consumerFetchMaxWaitThru, consumerFetchMaxWaitLat, consumerReceiveBuffer,
+          // Replication settings
+          replicaFetchMaxBytes, numReplicaFetchers, replicaLagTimeoutMs,
+          replicaSocketReceiveBuffer, totalReplicaConnections, replicationWireMbps,
+          // Per-broker analysis (F18, F19)
+          brokers, partitionsPerBroker, leaderPartitionsPerBroker, followerPartitionsPerBroker,
+          perBrokerProducerIngressMbps, perBrokerReplicationOutMbps,
+          perBrokerReplicationInMbps, perBrokerConsumerEgressMbps,
+          perBrokerTotalMbps, perBrokerUtilization, bottleneck,
+          perBrokerProducerConns, perBrokerConsumerConns,
+          perBrokerReplicaFetcherConnsIn, perBrokerReplicaFetcherConnsOut, perBrokerTotalConns,
+          // MTU/MSS metrics
+          segmentsPerBatch, kafkaOverheadPerBatch, effectivePayloadRatio, packetsPerMB, headerOverheadPct};
 }
 
 // ── Window sweep simulation ───────────────────────────────────────────────────
@@ -159,9 +315,9 @@ function simWindowSweep(bwMbps, rttMs) {
 // BBR:   Cardwell, Cheng, Gunn, Yeganeh, Jacobson (2016) ACM Queue 14(5).
 // AIMD fairness proof: Chiu & Jain (1989) Comput. Networks ISDN Syst. 17(1).
 // Simulates ~60 RTT rounds of a single TCP flow.
-// bwMbps: link bandwidth, rttMs: propagation RTT, bufMss: switch buffer in MSS
-function simBbrVsCubic(bwMbps, rttMs, bufMss = 50) {
-  const bdpMss   = Math.max(1, Math.round((bwMbps * 1e6 / 8) * (rttMs / 1000) / 1460));
+// bwMbps: link bandwidth, rttMs: propagation RTT, bufMss: switch buffer in MSS, mss: TCP MSS in bytes
+function simBbrVsCubic(bwMbps, rttMs, bufMss = 50, mss = 1460) {
+  const bdpMss   = Math.max(1, Math.round((bwMbps * 1e6 / 8) * (rttMs / 1000) / mss));
   const maxCwnd  = bdpMss + bufMss;   // pipe + switch buffer
   const data     = [];
 
@@ -183,7 +339,7 @@ function simBbrVsCubic(bwMbps, rttMs, bufMss = 50) {
     const inFlight_c = Math.min(cwnd_c, maxCwnd);
     qDepth_c = Math.max(0, inFlight_c - bdpMss);
     const rtt_c = rttMs + (qDepth_c / bdpMss) * rttMs * 2;  // RTT inflates with queue
-    const tput_c = Math.min(bwMbps, (inFlight_c * 1460 * 8) / (rtt_c / 1000) / 1e6);
+    const tput_c = Math.min(bwMbps, (inFlight_c * mss * 8) / (rtt_c / 1000) / 1e6);
 
     // Loss when queue overflows
     const loss_c = inFlight_c >= maxCwnd;
@@ -241,13 +397,19 @@ function simBbrVsCubic(bwMbps, rttMs, bufMss = 50) {
 
 // ── Scenario presets ──────────────────────────────────────────────────────────
 const SCENARIOS = [
-  { id:"local",       label:"Local DC",       bwMbps:10000, rttMin:0.08, rttAvg:0.12, pktLoss:0,   mtu:9000, conns:8,  latency:5   },
-  { id:"same_az",     label:"Same AZ",        bwMbps:1000,  rttMin:1,    rttAvg:2,    pktLoss:0,   mtu:1500, conns:8,  latency:10  },
-  { id:"cross_az",    label:"Cross-AZ",       bwMbps:1000,  rttMin:8,    rttAvg:12,   pktLoss:0,   mtu:1500, conns:4,  latency:20  },
-  { id:"cross_region",label:"Cross-Region",   bwMbps:500,   rttMin:55,   rttAvg:65,   pktLoss:0.01,mtu:1500, conns:2,  latency:100 },
-  { id:"multi_region",label:"Multi-Region",   bwMbps:200,   rttMin:140,  rttAvg:155,  pktLoss:0.02,mtu:1500, conns:2,  latency:250 },
-  { id:"satellite",   label:"Satellite",      bwMbps:50,    rttMin:580,  rttAvg:620,  pktLoss:0.1, mtu:1500, conns:1,  latency:900 },
-  { id:"custom",      label:"Custom / Measured", bwMbps:1000, rttMin:5, rttAvg:7,    pktLoss:0,   mtu:1500, conns:4,  latency:50  },
+  { id:"local",           label:"Local DC (Jumbo)", bwMbps:10000, rttMin:0.08, rttAvg:0.12, pktLoss:0,     mtu:9000, conns:8,  latency:5   },
+  // Cloud scenarios (generic, typical for AWS/GCP/Azure)
+  { id:"cloud_same_az",   label:"Cloud Same AZ/Zone", bwMbps:10000, rttMin:0.3, rttAvg:0.5, pktLoss:0,     mtu:9000, conns:8,  latency:5 },
+  { id:"cloud_cross_az",  label:"Cloud Cross-AZ (same region)", bwMbps:5000, rttMin:1.5, rttAvg:2.5, pktLoss:0,   mtu:9000, conns:4,  latency:10 },
+  { id:"cloud_cross_region",label:"Cloud Cross-Region", bwMbps:1000, rttMin:35, rttAvg:45, pktLoss:0.005, mtu:9000, conns:2,  latency:80 },
+  { id:"cloud_internet",  label:"Cloud → Internet",  bwMbps:500,   rttMin:20,   rttAvg:30,   pktLoss:0.01,  mtu:1500, conns:2,  latency:50  },
+  // Generic on-prem / standard MTU scenarios
+  { id:"same_az",         label:"On-Prem Same DC",        bwMbps:1000,  rttMin:1,    rttAvg:2,    pktLoss:0,     mtu:1500, conns:8,  latency:10  },
+  { id:"cross_az",        label:"On-Prem Cross-DC",       bwMbps:1000,  rttMin:8,    rttAvg:12,   pktLoss:0,     mtu:1500, conns:4,  latency:20  },
+  { id:"cross_region",    label:"Cross-Region (WAN)",     bwMbps:500,   rttMin:55,   rttAvg:65,   pktLoss:0.01,  mtu:1500, conns:2,  latency:100 },
+  { id:"multi_region",    label:"Multi-Region (Global)",  bwMbps:200,   rttMin:140,  rttAvg:155,  pktLoss:0.02,  mtu:1500, conns:2,  latency:250 },
+  { id:"satellite",       label:"Satellite",              bwMbps:50,    rttMin:580,  rttAvg:620,  pktLoss:0.1,   mtu:1500, conns:1,  latency:900 },
+  { id:"custom",          label:"Custom / Measured",      bwMbps:1000,  rttMin:5,    rttAvg:7,    pktLoss:0,     mtu:1500, conns:4,  latency:50  },
 ];
 
 const KAFKA_DEFAULTS = {
@@ -277,7 +439,44 @@ const StatBox = ({label, value, sub, color=P.accent, warn=false}) => (
   </div>
 );
 
-const Slider = ({label, value, min, max, step=1, unit="", onChange, color=P.accent}) => {
+const HelpIcon = ({text}) => {
+  const [show, setShow] = useState(false);
+  return (
+    <span style={{position:"relative", display:"inline-block", marginLeft:6}}>
+      <span
+        onMouseEnter={()=>setShow(true)}
+        onMouseLeave={()=>setShow(false)}
+        style={{
+          display:"inline-flex", alignItems:"center", justifyContent:"center",
+          width:16, height:16, borderRadius:"50%",
+          border:`1px solid ${P.muted}44`, color:P.muted,
+          fontSize:"0.7em", cursor:"help", fontWeight:600
+        }}>?</span>
+      {show && (
+        <div style={{
+          position:"absolute", bottom:"calc(100% + 6px)", left:"50%",
+          transform:"translateX(-50%)", zIndex:1000,
+          background:P.panel, border:`1px solid ${P.border}`, borderRadius:6,
+          padding:"8px 12px", minWidth:200, maxWidth:320,
+          fontSize:"0.82em", lineHeight:1.5, color:P.text,
+          boxShadow:"0 4px 12px rgba(0,0,0,0.3)", whiteSpace:"normal"
+        }}>
+          {text}
+          <div style={{
+            position:"absolute", top:"100%", left:"50%",
+            transform:"translateX(-50%)",
+            width:0, height:0,
+            borderLeft:"6px solid transparent",
+            borderRight:"6px solid transparent",
+            borderTop:`6px solid ${P.border}`
+          }} />
+        </div>
+      )}
+    </span>
+  );
+};
+
+const Slider = ({label, value, min, max, step=1, unit="", onChange, color=P.accent, help}) => {
   const [editing, setEditing] = useState(false);
   const [draft,   setDraft]   = useState("");
 
@@ -303,7 +502,10 @@ const Slider = ({label, value, min, max, step=1, unit="", onChange, color=P.acce
     <div style={{marginBottom:10}}>
       <div style={{display:"flex", justifyContent:"space-between",
         alignItems:"center", marginBottom:4}}>
-        <Label c={P.muted}>{label}</Label>
+        <div style={{display:"flex", alignItems:"center"}}>
+          <Label c={P.muted}>{label}</Label>
+          {help && <HelpIcon text={help} />}
+        </div>
         {editing ? (
           <input
             autoFocus
@@ -406,7 +608,14 @@ export default function App() {
   const [tab, setTab] = useState("overview");
   const [inflight, setInflight] = useState(5);
   const [partitions, setPartitions] = useState(12);
+  const [brokers, setBrokers] = useState(3);
   const [compressionRatio, setCompressionRatio] = useState(2.5);
+  const [replicationFactor, setReplicationFactor] = useState(3);
+  const [producerCount, setProducerCount] = useState(3);
+  const [consumerCount, setConsumerCount] = useState(2);
+  const [expectedThroughputPct, setExpectedThroughputPct] = useState(20);
+  const [expectedThroughputMbps, setExpectedThroughputMbps] = useState(2000);
+  const [throughputMode, setThroughputMode] = useState('percent'); // 'percent' or 'absolute'
 
   const scen = SCENARIOS.find(s=>s.id===scenarioId) || SCENARIOS[0];
 
@@ -423,7 +632,8 @@ export default function App() {
   const plateauKB = Math.max(4, Math.ceil(simBDP / 1024));
 
   const calc = calcFromMeasurements({
-    ...custom, plateauKB, inflight, partitions, compressionRatio,
+    ...custom, plateauKB, inflight, partitions, compressionRatio, replicationFactor, brokers,
+    producerCount, consumerCount, expectedThroughputPct, expectedThroughputMbps, throughputMode,
   });
 
   const sweepData = simWindowSweep(custom.bwMbps, custom.rttAvg);
@@ -440,6 +650,10 @@ export default function App() {
 
   // Diagnoses
   const diag = [];
+  if (calc.perBrokerUtilization > 100)
+    diag.push({type:"err", msg:`Per-broker NIC limit exceeded (${calc.perBrokerUtilization}%)! At RF=${replicationFactor}, each broker handles ${calc.partitionsPerBroker} partitions with ${replicationFactor}× write amplification. Solution: add brokers (scale to ${Math.ceil(partitions * replicationFactor / custom.bwMbps * calc.effectiveMbps / partitions)}+), reduce RF, or reduce partition count.`});
+  if (calc.perBrokerUtilization > 80 && calc.perBrokerUtilization <= 100)
+    diag.push({type:"warn", msg:`Per-broker bandwidth utilization is high (${calc.perBrokerUtilization}%). Replication (RF=${replicationFactor}) consumes ${fmtMbps(calc.perBrokerReplicationOutMbps + calc.perBrokerReplicationInMbps)} per broker. Limited headroom for bursts.`});
   if (custom.pktLoss > 0.1)
     diag.push({type:"err", msg:`Packet loss ${custom.pktLoss}% → Mathis bound: ${calc.mathisMbps?calc.mathisMbps.toFixed(0):"N/A"} Mbps. Fix network before buffer tuning.`});
   if (custom.pktLoss > 0 && custom.pktLoss <= 0.1)
@@ -448,6 +662,16 @@ export default function App() {
     diag.push({type:"warn", msg:`High BDP path (${fmtBytes(calc.empiricalBDP)}). Default Kafka buffers (256 KB) will severely limit throughput.`});
   if (custom.mtu === 1500 && custom.bwMbps >= 10000)
     diag.push({type:"warn", msg:`10+ Gbps with standard MTU 1500 — consider jumbo frames (MTU 9000) on the Kafka VLAN for ~5× reduction in header overhead.`});
+  if (custom.mtu > 1500 && custom.mtu !== 9000 && custom.mtu !== 9001 && custom.mtu !== 8896)
+    diag.push({type:"warn", msg:`Non-standard MTU ${custom.mtu}. Most cloud jumbo frame paths use 9000 (AWS 9001, GCP 8896). Verify end-to-end path MTU with: tracepath <broker-ip>`});
+  if (custom.mtu === 1500 && custom.bwMbps >= 1000) {
+    const stdPackets = calc.packetsPerMB;
+    const jumboPackets = Math.ceil(1048576 / 8960); // MSS at MTU 9000
+    const reduction = Math.round((stdPackets / jumboPackets) * 10) / 10;
+    diag.push({type:"info", msg:`At ${fmtMbps(custom.bwMbps)} with MTU 1500: ${stdPackets.toLocaleString()} packets/MB. Jumbo frames (MTU 9000) would reduce to ~${jumboPackets} packets/MB (~${reduction}× fewer interrupts).`});
+  }
+  if (calc.batchSize < calc.mss * 2)
+    diag.push({type:"warn", msg:`batch.size (${fmtBytes(calc.batchSize)}) < 2×MSS (${fmtBytes(calc.mss * 2)}). Sub-frame batches waste MTU capacity — increase batch.size or reduce MTU.`});
   if (custom.rttAvg > 100)
     diag.push({type:"warn", msg:`High RTT (${custom.rttAvg}ms) — linger.ms should be tuned carefully. Batch accumulation time must exceed BDP drain time (${calc.lingerThru}ms).`});
   if (calc.lingerLatency === 0)
@@ -503,13 +727,21 @@ retries                               = 3
 retry.backoff.ms                      = 50`;
 
   const brokerConf = `# Broker server.properties additions
+# ── Network I/O buffers ────────────────────────────────────────────────────
 socket.send.buffer.bytes              = ${calc.bufCeil}
 socket.receive.buffer.bytes           = ${calc.bufCeil}
 socket.request.max.bytes              = 104857600
 num.network.threads                   = 8
 num.io.threads                        = 8
-replica.fetch.max.bytes               = ${calc.batchSize}
-replica.socket.receive.buffer.bytes   = ${calc.bufCeil}`;
+
+# ── Replication (RF=${replicationFactor}, ${partitions} partitions = ${calc.totalReplicaConnections} follower connections) ───────
+replica.fetch.max.bytes               = ${calc.replicaFetchMaxBytes}
+replica.socket.receive.buffer.bytes   = ${calc.replicaSocketReceiveBuffer}
+num.replica.fetchers                  = ${calc.numReplicaFetchers}
+replica.lag.time.max.ms               = ${calc.replicaLagTimeoutMs}
+# Reasoning: timeout = RTT×4 (${custom.rttAvg*4}ms) + fetch.max.wait (${calc.consumerFetchMaxWaitThru}ms) + 5000ms margin
+# At ${partitions} partitions, RF=${replicationFactor}: ${calc.totalReplicaConnections} follower fetcher connections
+# Estimated replication bandwidth: ${fmtMbps(calc.replicationWireMbps)} (capped at 50% link capacity)`;
 
   const measureScript = `#!/bin/bash
 # 1. Start iperf3 server on broker:
@@ -580,28 +812,87 @@ sudo sysctl --system`;
       {/* Two-column layout: sliders + stats */}
       <div style={{display:"grid", gridTemplateColumns:"1fr 1fr", gap:16, marginBottom:20}}>
         <Card>
-          <Label c={P.muted} style={{display:"block", marginBottom:14}}>Path Parameters</Label>
-          <Slider label="Bandwidth" value={custom.bwMbps} min={10} max={50000} step={10}
+          <Label c={P.muted} style={{display:"block", marginBottom:14}}>Path & Cluster Parameters</Label>
+          <Slider label="Per-broker bandwidth limit" value={custom.bwMbps} min={10} max={50000} step={10}
             unit={custom.bwMbps>=1000?` (${(custom.bwMbps/1000).toFixed(custom.bwMbps%1000===0?0:1)} Gbps)`:" Mbps"}
-            color={P.accent} onChange={v=>setCustom(c=>({...c,bwMbps:v}))} />
+            color={P.accent} onChange={v=>setCustom(c=>({...c,bwMbps:v}))}
+            help="NIC bandwidth cap per broker node. In cloud (AWS/GCP/Azure), this is the per-VM network limit, not total cluster bandwidth. Each broker's NIC handles producer ingress, consumer egress, and replication traffic." />
           <Slider label="RTT min (ms)" value={custom.rttMin} min={0.05} max={700} step={0.05}
-            unit=" ms" color={P.green} onChange={v=>setCustom(c=>({...c,rttMin:v}))} />
+            unit=" ms" color={P.green} onChange={v=>setCustom(c=>({...c,rttMin:v}))}
+            help="Minimum round-trip time observed on the path (from ping or iperf3). Used to calculate theoretical BDP (bandwidth × RTT). Lower = less latency, smaller buffers needed." />
           <Slider label="RTT avg (ms)" value={custom.rttAvg} min={0.1} max={700} step={0.1}
-            unit=" ms" color={P.cyan} onChange={v=>setCustom(c=>({...c,rttAvg:v}))} />
+            unit=" ms" color={P.cyan} onChange={v=>setCustom(c=>({...c,rttAvg:v}))}
+            help="Average round-trip time under load. Used for batch timing (linger.ms) and timeout calculations. Higher RTT requires larger buffers and longer batch accumulation time." />
           <Slider label="Packet loss" value={custom.pktLoss} min={0} max={5} step={0.01}
-            unit="%" color={P.red} onChange={v=>setCustom(c=>({...c,pktLoss:v}))} />
+            unit="%" color={P.red} onChange={v=>setCustom(c=>({...c,pktLoss:v}))}
+            help="Packet loss rate on the path. Limits throughput via Mathis equation: T ≤ MSS / (RTT × √loss). Even 0.1% loss can significantly reduce throughput. Fix network issues before tuning buffers." />
           <Slider label="MTU" value={custom.mtu} min={576} max={9000} step={1}
-            unit=" bytes" color={P.yellow} onChange={v=>setCustom(c=>({...c,mtu:v}))} />
+            unit=" bytes" color={P.yellow} onChange={v=>setCustom(c=>({...c,mtu:v}))}
+            help="Maximum Transmission Unit. Standard Ethernet = 1500, Jumbo frames = 9000 (AWS 9001, GCP 8896). Larger MTU = less header overhead, fewer packets/MB. Only works on intra-VPC paths; internet egress uses 1500." />
           <Slider label="Parallel connections" value={custom.conns} min={1} max={32} step={1}
-            unit="" color={P.purple} onChange={v=>setCustom(c=>({...c,conns:v}))} />
+            unit="" color={P.purple} onChange={v=>setCustom(c=>({...c,conns:v}))}
+            help="Number of concurrent TCP connections used during iperf3 measurement. Each connection has its own window. Total window = batch.size × inflight × connections. Used to calculate buffer ceiling." />
           <Slider label="Latency budget" value={custom.latencyBudgetMs} min={1} max={1000} step={1}
-            unit=" ms" color={P.orange} onChange={v=>setCustom(c=>({...c,latencyBudgetMs:v}))} />
+            unit=" ms" color={P.orange} onChange={v=>setCustom(c=>({...c,latencyBudgetMs:v}))}
+            help="Maximum acceptable end-to-end latency for a message (producer → broker → consumer). Controls linger.ms ceiling: linger = budget - RTT - broker_overhead. Low budget = less batching = lower throughput." />
           <Slider label="Max in-flight requests" value={inflight} min={1} max={10} step={1}
-            unit="" color={P.cyan} onChange={setInflight} />
+            unit="" color={P.cyan} onChange={setInflight}
+            help="max.in.flight.requests.per.connection — number of unacknowledged batches allowed per connection. Effective window = batch.size × inflight. Higher = better throughput but more memory, harder to maintain ordering." />
+          <Slider label="Brokers in cluster" value={brokers} min={1} max={24} step={1}
+            unit="" color={P.orange} onChange={setBrokers}
+            help="Total number of broker nodes in the Kafka cluster. Partitions are distributed evenly across brokers. More brokers = less partitions/broker = less per-broker bandwidth usage." />
           <Slider label="Partitions (topic total)" value={partitions} min={1} max={256} step={1}
-            unit="" color={P.green} onChange={setPartitions} />
+            unit={` (${calc.partitionsPerBroker}/broker)`} color={P.green} onChange={setPartitions}
+            help="Total number of partitions in the topic. Distributed across brokers. Each partition = 1 TCP connection from producer. More partitions = higher parallelism but more connections and memory overhead." />
+          <Slider label="Replication factor" value={replicationFactor} min={1} max={10} step={1}
+            unit={` (RF=${replicationFactor})`} color={P.red} onChange={setReplicationFactor}
+            help="Number of replicas per partition (including leader). RF=3 means 1 leader + 2 followers. Higher RF = more durability but multiplies write bandwidth: RF=3 → 3× write amplification on broker NICs." />
+          <Slider label="Producer instances" value={producerCount} min={1} max={50} step={1}
+            unit="" color={P.cyan} onChange={setProducerCount}
+            help="Number of producer application instances. Each connects to brokers hosting its assigned partitions. Used to calculate per-broker connection count, not throughput (see Expected throughput)." />
+          <Slider label="Consumer instances" value={consumerCount} min={1} max={50} step={1}
+            unit="" color={P.orange} onChange={setConsumerCount}
+            help="Number of consumer application instances. Each connects to brokers hosting partitions it consumes. Used to calculate per-broker connection count. Max useful = partition count (beyond that, extra consumers are idle)." />
+          {/* Expected throughput with mode toggle */}
+          <div>
+            <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6}}>
+              <Label c={P.muted}>Expected throughput</Label>
+              <button
+                onClick={() => {
+                  if (throughputMode === 'percent') {
+                    // Switching to absolute: sync absolute value from percentage
+                    setExpectedThroughputMbps(Math.round(calc.expectedProducerMbps));
+                    setThroughputMode('absolute');
+                  } else {
+                    // Switching to percent: sync percentage from absolute value
+                    setExpectedThroughputPct(Math.round(expectedThroughputMbps / calc.effectiveMbps * 100));
+                    setThroughputMode('percent');
+                  }
+                }}
+                style={{
+                  background: P.panel2, border: `1px solid ${P.border}`,
+                  borderRadius: 6, padding: "4px 10px", fontSize: "0.75em",
+                  color: P.accent, cursor: "pointer", fontWeight: 600,
+                  transition: "all 0.15s"
+                }}>
+                {throughputMode === 'percent' ? '% → Mbps' : 'Mbps → %'}
+              </button>
+            </div>
+            {throughputMode === 'percent' ? (
+              <Slider value={expectedThroughputPct} min={1} max={100} step={1}
+                unit={`% (≈ ${fmtMbps(calc.expectedProducerMbps)})`} color={P.yellow} onChange={setExpectedThroughputPct}
+                help="TOTAL expected producer throughput across all partitions, as % of link capacity. Real workloads rarely saturate the link (20-30% is typical with RF=3, min.isr=2). Used to calculate per-broker bandwidth budget. 100% assumes producers will fully saturate the NIC (unrealistic)." />
+            ) : (
+              <Slider value={expectedThroughputMbps} min={1} max={custom.bwMbps}
+                step={custom.bwMbps >= 10000 ? 100 : custom.bwMbps >= 1000 ? 10 : 1}
+                unit={`Mbps (${Math.round(expectedThroughputMbps / calc.effectiveMbps * 100)}% of ${fmtMbps(calc.effectiveMbps)})`}
+                color={P.yellow} onChange={setExpectedThroughputMbps}
+                help="TOTAL expected producer throughput across all partitions, as absolute Mbps value. Specify directly if you know the expected workload rate from monitoring (e.g., 500 Mbps aggregate). Used to calculate per-broker bandwidth budget independently of link capacity." />
+            )}
+          </div>
           <Slider label="Compression ratio (lz4/zstd)" value={compressionRatio} min={1} max={6} step={0.1}
-            unit={`× (${compressionRatio.toFixed(1)}×)`} color={P.purple} onChange={setCompressionRatio} />
+            unit={`× (${compressionRatio.toFixed(1)}×)`} color={P.purple} onChange={setCompressionRatio}
+            help="Compression ratio achieved by codec (lz4/zstd). 2.5× = 1 MB payload compresses to 400 KB on wire. Higher ratio = less network traffic, more CPU. JSON/text compresses well (3-5×), binary/encrypted data compresses poorly (1-1.5×)." />
         </Card>
 
         <div style={{display:"flex", flexDirection:"column", gap:10}}>
@@ -618,14 +909,54 @@ sudo sysctl --system`;
               sub={`min ${fmtBytes(calc.batchMin)} (BDP÷inflight)`} />
             <StatBox label="linger.ms (thru)" value={`${calc.lingerThru} ms`} color={P.orange}
               sub="BDP drain time at measured BW" />
-            <StatBox label="Total wire throughput"
-              value={`${fmtMbps(calc.effectiveMbps)} wire`} color={P.green}
-              warn={calc.effectiveMbps < custom.bwMbps * 0.5}
-              sub={`${fmtMbps(calc.effectiveLogicalMbps)} app data · independent of partition count`} />
-            <StatBox label={`Per partition (${partitions}p)`}
-              value={`${fmtMbps(calc.perPartWireMbps)} wire`} color={P.cyan}
-              warn={calc.perPartBdpPct < 20}
-              sub={`${fmtMbps(calc.perPartLogicalMbps)} app data · ${calc.perPartBdpPct}% BDP util`} />
+          </div>
+
+          {/* Per-broker bandwidth breakdown */}
+          <Card style={{padding:"12px 14px"}}>
+            <Label c={P.muted} style={{marginBottom:8}}>Per-broker bandwidth budget (F18, F19)</Label>
+            <div style={{display:"grid", gridTemplateColumns:"repeat(2, 1fr)", gap:8, marginBottom:10}}>
+              <div style={{fontSize:"0.75em", color:P.muted}}>
+                <span style={{color:P.accent}}>▸</span> Producer IN: {fmtMbps(calc.perBrokerProducerIngressMbps)}
+              </div>
+              <div style={{fontSize:"0.75em", color:P.muted}}>
+                <span style={{color:P.green}}>▸</span> Consumer OUT: {fmtMbps(calc.perBrokerConsumerEgressMbps)}
+              </div>
+              <div style={{fontSize:"0.75em", color:P.muted}}>
+                <span style={{color:P.yellow}}>▸</span> Replication OUT (leader→followers): {fmtMbps(calc.perBrokerReplicationOutMbps)}
+              </div>
+              <div style={{fontSize:"0.75em", color:P.muted}}>
+                <span style={{color:P.cyan}}>▸</span> Replication IN (as follower): {fmtMbps(calc.perBrokerReplicationInMbps)}
+              </div>
+            </div>
+            <div style={{borderTop:`1px solid ${P.border}`, paddingTop:8, display:"flex", justifyContent:"space-between", alignItems:"center"}}>
+              <span style={{fontSize:"0.8em", color:P.text, fontWeight:600}}>Total per broker:</span>
+              <span style={{fontSize:"0.9em", color: calc.perBrokerUtilization > 100 ? P.red : calc.perBrokerUtilization > 80 ? P.yellow : P.green, fontWeight:700, fontFamily:"monospace"}}>
+                {fmtMbps(calc.perBrokerTotalMbps)} / {fmtMbps(custom.bwMbps)} ({calc.perBrokerUtilization}%)
+              </span>
+            </div>
+            {calc.perBrokerUtilization > 100 && (
+              <div style={{marginTop:8, padding:"6px 8px", background:P.red+"15", border:`1px solid ${P.red}44`, borderRadius:5, fontSize:"0.75em", color:P.red}}>
+                ⚠ Per-broker NIC limit exceeded! Reduce partitions/broker, increase broker count, or reduce replication factor.
+              </div>
+            )}
+            {calc.perBrokerUtilization > 80 && calc.perBrokerUtilization <= 100 && (
+              <div style={{marginTop:8, padding:"6px 8px", background:P.yellow+"15", border:`1px solid ${P.yellow}44`, borderRadius:5, fontSize:"0.75em", color:P.yellow}}>
+                ⚠ High utilization ({calc.perBrokerUtilization}%). Little headroom for traffic bursts.
+              </div>
+            )}
+          </Card>
+
+          <div style={{display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:10}}>
+            <StatBox label={`Partitions per broker`}
+              value={`${calc.partitionsPerBroker}`} color={P.green}
+              sub={`${partitions} total ÷ ${brokers} brokers`} />
+            <StatBox label={`Connections per broker`}
+              value={`${calc.perBrokerTotalConns}`} color={P.cyan}
+              sub={`${calc.perBrokerProducerConns} prod + ${calc.perBrokerConsumerConns} cons + ${calc.perBrokerReplicaFetcherConnsIn} repl`} />
+            <StatBox label="Bottleneck"
+              value={calc.bottleneck} color={calc.bottleneck.includes("NIC") ? P.red : P.accent}
+              warn={calc.bottleneck.includes("NIC")}
+              sub={calc.bottleneck.includes("NIC") ? "Scale brokers or reduce RF" : "See diagnostics"} />
           </div>
 
           {/* Diagnosis */}
@@ -640,8 +971,9 @@ sudo sysctl --system`;
       {/* Tabs */}
       <div style={{display:"flex", gap:8, flexWrap:"wrap", marginBottom:16}}>
         {[
-          ["overview","Overview"],["throughput","Throughput"],["bbr","BBR vs CUBIC"],["sysctl","sysctl"],
-          ["kafka","Kafka Props"],["broker","Broker"],
+          ["overview","Overview"],["throughput","Throughput"],["bbr","BBR vs CUBIC"],
+          ["mtu","MTU Impact"],["sysctl","sysctl"],
+          ["kafka","Kafka Props"],["consumer","Consumer"],["broker","Broker"],
           ["table","Scenarios"],["scripts","Scripts"],
         ].map(([id,lbl])=>(
           <TabBtn key={id} active={tab===id} onClick={()=>setTab(id)}>{lbl}</TabBtn>
@@ -671,17 +1003,31 @@ sudo sysctl --system`;
             ))}
           </div>
 
-          {/* Wire vs app data clarification */}
+          {/* Per-broker bandwidth model explanation */}
           <div style={{background:P.panel2, border:`1px solid ${P.border}`, borderRadius:8,
             padding:"10px 14px", fontSize:"0.8em", color:P.muted, lineHeight:1.6}}>
-            <span style={{color:P.text, fontWeight:600}}>Total vs per-partition: </span>
-            Total wire throughput and app data rate are fixed by bandwidth, RTT, window size, and loss —
-            they do not change with partition count. The partition count divides that total capacity
-            across partitions: more partitions means less throughput available per partition.
-            The <span style={{color:P.cyan, fontFamily:"monospace"}}>Per partition ({partitions}p)</span> box
-            and chart respond to the Partitions slider.
-            A {compressionRatio}× compression ratio means {fmtMbps(calc.effectiveMbps)} wire
-            delivers {fmtMbps(calc.effectiveLogicalMbps)} of application data in total.
+            <span style={{color:P.text, fontWeight:600}}>Critical: Per-broker bandwidth model (F18, F19)</span>
+            <div style={{marginTop:6}}>
+              The bandwidth slider represents the <strong style={{color:P.text}}>per-broker NIC limit</strong> (e.g., EC2 instance network cap),
+              NOT total cluster bandwidth. Each broker's NIC handles ALL traffic: producer writes, consumer reads,
+              AND replication in both directions.
+            </div>
+            <div style={{marginTop:6}}>
+              <span style={{color:P.text, fontWeight:600}}>Replication amplification:</span> At RF={replicationFactor},
+              each 1 MB producer write → 1 MB to leader + {replicationFactor-1} MB replication OUT (leader→followers) + replication IN (as follower for other partitions).
+              Total = {replicationFactor}× write amplification on the leader broker's NIC.
+            </div>
+            <div style={{marginTop:6}}>
+              With {brokers} brokers, {partitions} partitions: each broker handles ~{calc.partitionsPerBroker} leader partitions.
+              Per-broker bandwidth = {fmtMbps(calc.perBrokerProducerIngressMbps)} (producer) + {fmtMbps(calc.perBrokerReplicationOutMbps)} (repl OUT)
+              + {fmtMbps(calc.perBrokerReplicationInMbps)} (repl IN) + {fmtMbps(calc.perBrokerConsumerEgressMbps)} (consumer)
+              = <strong style={{color: calc.perBrokerUtilization > 100 ? P.red : P.accent}}>{fmtMbps(calc.perBrokerTotalMbps)} ({calc.perBrokerUtilization}%)</strong>.
+            </div>
+            {calc.perBrokerUtilization > 100 && (
+              <div style={{marginTop:6, color:P.red, fontWeight:600}}>
+                ⚠ Bottleneck: per-broker NIC saturated! Scale to {Math.ceil(calc.perBrokerTotalMbps / custom.bwMbps * brokers)}+ brokers or reduce RF.
+              </div>
+            )}
           </div>
 
           {/* Throughput breakdown explanation */}
@@ -838,7 +1184,7 @@ sudo sysctl --system`;
       {/* Tab: BBR vs CUBIC */}
       {tab === "bbr" && (() => {
         const bufMss = 50;
-        const { data, bdpMss, maxCwnd } = simBbrVsCubic(custom.bwMbps, custom.rttAvg, bufMss);
+        const { data, bdpMss, maxCwnd } = simBbrVsCubic(custom.bwMbps, custom.rttAvg, bufMss, calc.mss);
 
         const chartProps = {
           margin:{top:4, right:20, bottom:20, left:10},
@@ -1134,6 +1480,296 @@ sudo sysctl --system`;
         </div>
       )}
 
+      {/* Tab: MTU Impact Analysis */}
+      {tab === "mtu" && (() => {
+        // Data generator: packet efficiency at different MTUs
+        const mtuData = [576, 1500, 9000].map(mtuVal => {
+          const mssVal = mtuVal - 40;
+          const headerOverhead = (40 / mtuVal * 100);
+          const packetsPerMB = Math.ceil(1048576 / mssVal);
+          return { mtu: mtuVal, headerOverhead, packetsPerMB };
+        });
+
+        // Data generator: throughput vs MTU for different RTT scenarios
+        const throughputVsMtu = [];
+        const rtts = [10, 50, 100]; // ms
+        for (let mtuVal = 576; mtuVal <= 9000; mtuVal += (mtuVal < 1500 ? 100 : 500)) {
+          const mssVal = mtuVal - 40;
+          const point = { mtu: mtuVal };
+          rtts.forEach(rtt => {
+            // Throughput for single packet: T = (MSS × 8) / RTT
+            point[`rtt${rtt}`] = Math.round((mssVal * 8) / (rtt / 1000) / 1e6 * 10) / 10;
+          });
+          throughputVsMtu.push(point);
+        }
+
+        return (
+          <div style={{display:"grid", gap:16}}>
+
+            {/* Packet Efficiency Chart */}
+            <Card>
+              <div style={{marginBottom:12}}>
+                <Label c={P.muted}>Packet Efficiency vs MTU</Label>
+                <div style={{color:P.muted, fontSize:"0.78em", marginTop:6}}>
+                  Larger MTU → less header overhead → fewer packets → fewer interrupts.
+                  Standard Ethernet (1500) vs Jumbo Frames (9000) vs Minimum (576).
+                </div>
+              </div>
+              <ResponsiveContainer width="100%" height={240}>
+                <BarChart data={mtuData}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={P.border} />
+                  <XAxis dataKey="mtu" stroke={P.muted} tick={{fontSize:10}}
+                    label={{value:"MTU (bytes)", position:"insideBottom", dy:10, fill:P.muted, fontSize:11}} />
+                  <YAxis yAxisId="left" stroke={P.muted} tick={{fontSize:10}}
+                    label={{value:"Header Overhead %", angle:-90, position:"insideLeft", dx:-8, fill:P.muted, fontSize:11}} />
+                  <YAxis yAxisId="right" orientation="right" stroke={P.green} tick={{fontSize:10}}
+                    label={{value:"Packets per MB", angle:90, position:"insideRight", dx:8, fill:P.green, fontSize:11}} />
+                  <Tooltip contentStyle={{background:P.panel, border:`1px solid ${P.border}`, borderRadius:6, fontSize:"0.85em"}} />
+                  <Bar yAxisId="left" dataKey="headerOverhead" fill={P.red} name="Header Overhead %" />
+                  <Bar yAxisId="right" dataKey="packetsPerMB" fill={P.green} name="Packets/MB" />
+                </BarChart>
+              </ResponsiveContainer>
+              <div style={{marginTop:12, padding:12, background:P.panel2, borderRadius:6, fontSize:"0.85em"}}>
+                <strong style={{color:P.accent}}>Current MTU {custom.mtu}:</strong>
+                <div style={{marginTop:6, color:P.muted}}>
+                  • MSS: {calc.mss} bytes (MTU - 40)<br/>
+                  • Header overhead: {calc.headerOverheadPct.toFixed(2)}%<br/>
+                  • Packets per MB: {calc.packetsPerMB.toLocaleString()}<br/>
+                  • Segments per Kafka batch ({fmtBytes(calc.batchSize)}): {calc.segmentsPerBatch}<br/>
+                  • Kafka protocol overhead per batch: ~{fmtBytes(calc.kafkaOverheadPerBatch)} ({(100-calc.effectivePayloadRatio*100).toFixed(1)}% of batch)
+                </div>
+              </div>
+            </Card>
+
+            {/* Throughput vs MTU Chart */}
+            <Card>
+              <div style={{marginBottom:12}}>
+                <Label c={P.muted}>Single-Packet Throughput vs MTU</Label>
+                <div style={{color:P.muted, fontSize:"0.78em", marginTop:6}}>
+                  For 1 Gbps link at different RTTs. Shows throughput ceiling imposed by MTU.
+                  Formula: T = (MSS × 8) / RTT where MSS = MTU - 40
+                </div>
+              </div>
+              <ResponsiveContainer width="100%" height={240}>
+                <LineChart data={throughputVsMtu}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={P.border} />
+                  <XAxis dataKey="mtu" stroke={P.muted} tick={{fontSize:10}}
+                    label={{value:"MTU (bytes)", position:"insideBottom", dy:10, fill:P.muted, fontSize:11}} />
+                  <YAxis stroke={P.muted} tick={{fontSize:10}}
+                    label={{value:"Throughput (Mbps)", angle:-90, position:"insideLeft", dx:-8, fill:P.muted, fontSize:11}} />
+                  <Tooltip contentStyle={{background:P.panel, border:`1px solid ${P.border}`, borderRadius:6, fontSize:"0.85em"}} />
+                  <Legend wrapperStyle={{fontSize:"0.78em", paddingTop:4}} />
+                  <ReferenceLine x={1500} stroke={P.yellow} strokeDasharray="4 3"
+                    label={{value:"Standard", fill:P.yellow, fontSize:10, position:"top"}} />
+                  <ReferenceLine x={9000} stroke={P.green} strokeDasharray="4 3"
+                    label={{value:"Jumbo", fill:P.green, fontSize:10, position:"top"}} />
+                  <Line type="monotone" dataKey="rtt10" name="RTT 10ms" stroke={P.green} strokeWidth={2} dot={false} />
+                  <Line type="monotone" dataKey="rtt50" name="RTT 50ms" stroke={P.cyan} strokeWidth={2} dot={false} />
+                  <Line type="monotone" dataKey="rtt100" name="RTT 100ms" stroke={P.red} strokeWidth={2} dot={false} />
+                </LineChart>
+              </ResponsiveContainer>
+            </Card>
+
+            {/* Cloud Provider MTU Table */}
+            <Card>
+              <Label c={P.muted}>Cloud Provider MTU Limits</Label>
+              <div style={{marginTop:12, overflowX:"auto"}}>
+                <table style={{width:"100%", fontSize:"0.85em", borderCollapse:"collapse"}}>
+                  <thead>
+                    <tr style={{borderBottom:`2px solid ${P.border}`}}>
+                      <th style={{padding:"8px", textAlign:"left", color:P.muted}}>Provider</th>
+                      <th style={{padding:"8px", textAlign:"left", color:P.muted}}>Intra-VPC MTU</th>
+                      <th style={{padding:"8px", textAlign:"left", color:P.muted}}>Internet Egress MTU</th>
+                      <th style={{padding:"8px", textAlign:"left", color:P.muted}}>Notes</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr style={{borderBottom:`1px solid ${P.border}`}}>
+                      <td style={{padding:"8px", color:P.text, fontWeight:600}}>AWS</td>
+                      <td style={{padding:"8px", color:P.green, fontFamily:"monospace"}}>9001</td>
+                      <td style={{padding:"8px", color:P.yellow, fontFamily:"monospace"}}>1500</td>
+                      <td style={{padding:"8px", color:P.muted, fontSize:"0.9em"}}>Enhanced Networking required; check instance type</td>
+                    </tr>
+                    <tr style={{borderBottom:`1px solid ${P.border}`}}>
+                      <td style={{padding:"8px", color:P.text, fontWeight:600}}>GCP</td>
+                      <td style={{padding:"8px", color:P.green, fontFamily:"monospace"}}>8896</td>
+                      <td style={{padding:"8px", color:P.yellow, fontFamily:"monospace"}}>1460</td>
+                      <td style={{padding:"8px", color:P.muted, fontSize:"0.9em"}}>VPC default; external IP uses 1460 (GRE overhead)</td>
+                    </tr>
+                    <tr>
+                      <td style={{padding:"8px", color:P.text, fontWeight:600}}>Azure</td>
+                      <td style={{padding:"8px", color:P.green, fontFamily:"monospace"}}>9000</td>
+                      <td style={{padding:"8px", color:P.yellow, fontFamily:"monospace"}}>1400</td>
+                      <td style={{padding:"8px", color:P.muted, fontSize:"0.9em"}}>VNet default; internet uses 1400 (VXLAN overhead)</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <div style={{marginTop:12, padding:10, background:P.bg, borderLeft:`3px solid ${P.yellow}`, fontSize:"0.85em"}}>
+                ⚠ <strong>Jumbo frames work only on intra-VPC paths.</strong> Internet-bound traffic reverts to standard MTU.
+                Hybrid deployments (VPC + internet consumers) must use min(MTU_vpc, MTU_internet) - 40 as effective MSS.
+              </div>
+            </Card>
+
+            {/* Fragmentation Diagnostic */}
+            <Card>
+              <Label c={P.muted}>Path MTU Discovery (PMTUD) & Diagnostics</Label>
+              <div style={{marginTop:12, fontSize:"0.85em", lineHeight:1.7, color:P.muted}}>
+                <p>TCP relies on ICMP "Fragmentation Needed" (Type 3, Code 4) to discover path MTU.
+                If firewalls block ICMP, you get a <strong style={{color:P.red}}>PMTUD black hole</strong>:
+                handshakes succeed (small packets) but transfers stall (large segments silently drop).</p>
+
+                <div style={{marginTop:12, padding:10, background:P.bg, borderRadius:6, fontFamily:"monospace", fontSize:"0.9em"}}>
+                  # Detect path MTU to broker<br/>
+                  tracepath broker.example.com<br/><br/>
+                  # Capture negotiated MSS from active connection<br/>
+                  ss -tin dst broker.example.com | grep mss<br/><br/>
+                  # Force MSS clamping on tunnel interface<br/>
+                  iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN \<br/>
+                  &nbsp;&nbsp;-j TCPMSS --clamp-mss-to-pmtu
+                </div>
+              </div>
+            </Card>
+
+            {/* Fragmentation Loss Amplification */}
+            <Card>
+              <Label c={P.muted}>Fragmentation Loss Amplification</Label>
+              <div style={{marginTop:12, fontSize:"0.85em", lineHeight:1.7, color:P.muted}}>
+                <p>When a packet exceeds path MTU and fragments into <em>N</em> fragments,
+                losing <strong style={{color:P.red}}>any single fragment</strong> forces retransmission
+                of the <em>entire original packet</em>. This creates multiplicative loss:</p>
+
+                <div style={{marginTop:12, marginBottom:12, padding:12, background:P.panel2, borderRadius:6, fontFamily:"monospace", fontSize:"0.9em", color:P.text}}>
+                  P<sub>effective</sub> = 1 − (1 − p)<sup>N</sup>&nbsp;&nbsp;&nbsp;where N = ⌈packet_size / path_MTU⌉
+                </div>
+
+                {(() => {
+                  // Calculate fragmentation scenario
+                  // Assume jumbo frame (9000) might fragment to 1500 on internet egress
+                  const pathMtu = custom.mtu > 1500 ? 1500 : custom.mtu; // Assume internet path if jumbo configured
+                  const largePacket = custom.mtu; // User's configured MTU
+                  const fragmentCount = largePacket > pathMtu ? Math.ceil(largePacket / pathMtu) : 1;
+                  const perFragmentLoss = custom.pktLoss;
+                  const effectiveLoss = 1 - Math.pow(1 - perFragmentLoss, fragmentCount);
+                  const lossAmplification = perFragmentLoss > 0 ? effectiveLoss / perFragmentLoss : 1;
+
+                  // Mathis throughput degradation
+                  const mathisBefore = calc.mss / (custom.rttAvg / 1000 * Math.sqrt(perFragmentLoss)) / 125000;
+                  const mathisAfter = calc.mss / (custom.rttAvg / 1000 * Math.sqrt(effectiveLoss)) / 125000;
+                  const throughputRatio = perFragmentLoss > 0 && effectiveLoss > 0 ? mathisBefore / mathisAfter : 1;
+
+                  const hasFragmentation = fragmentCount > 1;
+
+                  return (
+                    <div style={{marginTop:12}}>
+                      <div style={{display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:12, marginBottom:12}}>
+                        <StatBox label="Configured MTU" value={custom.mtu} sub={`MSS: ${calc.mss}`} color={P.accent} />
+                        <StatBox label="Assumed Path MTU" value={pathMtu}
+                          sub={custom.mtu > 1500 ? "Internet egress" : "Same as configured"}
+                          color={hasFragmentation ? P.yellow : P.green} />
+                        <StatBox label="Fragments / Packet" value={fragmentCount}
+                          color={hasFragmentation ? P.red : P.green}
+                          warn={hasFragmentation} />
+                      </div>
+
+                      {hasFragmentation && perFragmentLoss > 0 && (
+                        <div style={{padding:12, background:P.bg, borderLeft:`3px solid ${P.red}`, marginBottom:12}}>
+                          <strong style={{color:P.red}}>⚠ Fragmentation detected!</strong>
+                          <div style={{marginTop:8, color:P.muted}}>
+                            • Per-fragment loss: {(perFragmentLoss * 100).toFixed(2)}%<br/>
+                            • Effective packet loss: <strong style={{color:P.red}}>{(effectiveLoss * 100).toFixed(2)}%</strong> (amplification: {lossAmplification.toFixed(1)}×)<br/>
+                            • Mathis throughput degradation: {throughputRatio.toFixed(2)}× slower<br/>
+                            • Before fragmentation: {mathisBefore.toFixed(1)} Mbps → After: {mathisAfter.toFixed(1)} Mbps
+                          </div>
+                          <div style={{marginTop:12, color:P.accent}}>
+                            <strong>Recommendation:</strong> Reduce MTU to {pathMtu} or use MSS clamping to prevent fragmentation.
+                            Run <code style={{background:P.panel, padding:"2px 6px", borderRadius:3}}>tracepath</code> to
+                            verify actual path MTU before deploying jumbo frames.
+                          </div>
+                        </div>
+                      )}
+
+                      {!hasFragmentation && (
+                        <div style={{padding:12, background:P.bg, borderLeft:`3px solid ${P.green}`, marginBottom:12, color:P.green}}>
+                          ✓ No fragmentation expected. MTU ≤ path MTU.
+                        </div>
+                      )}
+
+                      {/* Loss amplification chart */}
+                      <div style={{marginTop:16}}>
+                        <div style={{color:P.muted, fontSize:"0.9em", marginBottom:8}}>
+                          <strong>Loss Amplification by Fragment Count</strong> (current per-fragment loss: {(perFragmentLoss * 100).toFixed(2)}%)
+                        </div>
+                        <ResponsiveContainer width="100%" height={200}>
+                          <BarChart data={(() => {
+                            const fragCounts = [1, 2, 3, 5, 7, 10];
+                            return fragCounts.map(n => {
+                              const effLoss = 1 - Math.pow(1 - perFragmentLoss, n);
+                              const amplification = perFragmentLoss > 0 ? effLoss / perFragmentLoss : 1;
+                              return {
+                                fragments: `${n} fragment${n > 1 ? 's' : ''}`,
+                                effectiveLoss: parseFloat((effLoss * 100).toFixed(2)),
+                                amplificationLabel: `${amplification.toFixed(1)}× amplification`,
+                                isCurrent: n === fragmentCount
+                              };
+                            });
+                          })()}>
+                            <CartesianGrid strokeDasharray="3 3" stroke={P.border} />
+                            <XAxis dataKey="fragments" stroke={P.muted} tick={{fontSize:10}}
+                              label={{value:"Fragments per Packet", position:"insideBottom", dy:10, fill:P.muted, fontSize:11}} />
+                            <YAxis stroke={P.muted} tick={{fontSize:10}}
+                              label={{value:"Effective Packet Loss %", angle:-90, position:"insideLeft", dx:-8, fill:P.muted, fontSize:11}} />
+                            <Tooltip contentStyle={{background:P.panel, border:`1px solid ${P.border}`, borderRadius:6, fontSize:"0.85em"}}
+                              formatter={(value, name, props) => {
+                                if (name === "effectiveLoss") {
+                                  return [
+                                    <div key="tooltip">
+                                      <div><strong>{value}%</strong> effective packet loss</div>
+                                      <div style={{fontSize:"0.9em", marginTop:4, opacity:0.8}}>
+                                        {props.payload.amplificationLabel}
+                                      </div>
+                                    </div>,
+                                    ""
+                                  ];
+                                }
+                                return [value, name];
+                              }} />
+                            <Bar dataKey="effectiveLoss" fill={P.red} name="Effective Loss %">
+                              {(() => {
+                                const data = [1, 2, 3, 5, 7, 10].map(n => ({
+                                  fragments: n,
+                                  effectiveLoss: (1 - Math.pow(1 - perFragmentLoss, n)) * 100,
+                                  isCurrent: n === fragmentCount
+                                }));
+                                return data.map((entry, index) => (
+                                  <Cell key={`cell-${index}`} fill={entry.isCurrent ? P.yellow : P.red} />
+                                ));
+                              })()}
+                            </Bar>
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </div>
+
+                      <div style={{marginTop:16, fontSize:"0.85em", lineHeight:1.7, color:P.muted}}>
+                        <strong style={{color:P.text}}>Why fragmentation + loss is catastrophic:</strong>
+                        <ul style={{marginTop:6, marginLeft:20}}>
+                          <li>Losing 1 of 7 fragments → entire 9KB packet lost and retransmitted</li>
+                          <li>Reassembly timeout (30-60s) adds severe latency spikes</li>
+                          <li>Out-of-order fragments trigger unnecessary TCP retransmissions</li>
+                          <li>Many firewalls drop fragmented packets entirely for security</li>
+                          <li>Combines with Mathis equation to create {throughputRatio.toFixed(1)}× throughput reduction</li>
+                        </ul>
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+            </Card>
+
+          </div>
+        );
+      })()}
+
       {/* Tab: sysctl */}
       {tab === "sysctl" && (
         <Card>
@@ -1210,21 +1846,182 @@ sudo sysctl --system`;
         </div>
       )}
 
+      {/* Tab: Consumer */}
+      {tab === "consumer" && (
+        <div style={{display:"grid", gap:16}}>
+          <Card>
+            <Label c={P.green} style={{display:"block",marginBottom:4}}>Consumer Configuration</Label>
+            <div style={{color:P.muted,fontSize:"0.8em",marginBottom:8}}>
+              Consumer fetch settings control the tradeoff between throughput (batching) and latency.
+              Similar to producer linger.ms, but on the receive side.
+            </div>
+            <CodeBlock>{`# Consumer configuration (add to consumer.properties)
+# ── Throughput profile ─────────────────────────────────────────────────────
+fetch.min.bytes                       = ${calc.consumerFetchMinBytes}
+fetch.max.wait.ms                     = ${calc.consumerFetchMaxWaitThru}
+max.partition.fetch.bytes             = ${calc.consumerFetchMaxBytes}
+receive.buffer.bytes                  = ${calc.consumerReceiveBuffer}
+
+# Reasoning (F13, F14):
+# - max.partition.fetch.bytes ≥ producer batch.size (${fmtBytes(calc.batchSize)})
+#   ensures consumer can receive full producer batches without fragmenting
+# - fetch.min.bytes = batch.size/2 balances batching vs latency
+# - fetch.max.wait.ms = ${calc.consumerFetchMaxWaitThru}ms matches producer linger for throughput
+# - receive.buffer.bytes = ${fmtBytes(calc.consumerReceiveBuffer)} covers BDP×conns×2
+
+# ── Latency profile (minimize wait time) ───────────────────────────────────
+fetch.min.bytes                       = 1
+fetch.max.wait.ms                     = ${calc.consumerFetchMaxWaitLat}
+max.partition.fetch.bytes             = ${calc.consumerFetchMaxBytes}
+receive.buffer.bytes                  = ${calc.consumerReceiveBuffer}
+# Latency budget: ${custom.latencyBudgetMs}ms → fetch.max.wait ≤ ${calc.consumerFetchMaxWaitLat}ms`}</CodeBlock>
+          </Card>
+
+          <Card>
+            <Label c={P.muted} style={{display:"block",marginBottom:10}}>Consumer fetch parameters explained</Label>
+            <div style={{display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(240px,1fr))", gap:10}}>
+              {[
+                {param:"max.partition.fetch.bytes", dflt:"1 MB", rec:fmtBytes(calc.consumerFetchMaxBytes), color:P.purple,
+                 note:`Must be ≥ producer batch.size (${fmtBytes(calc.batchSize)}) to avoid fetch fragmentation. Per partition.`},
+                {param:"fetch.min.bytes",        dflt:"1 byte",  rec:fmtBytes(calc.consumerFetchMinBytes), color:P.orange,
+                 note:"Broker waits until this much data available or fetch.max.wait.ms expires. Higher = more batching."},
+                {param:"fetch.max.wait.ms",      dflt:"500 ms",  rec:`${calc.consumerFetchMaxWaitThru}ms (thru) / ${calc.consumerFetchMaxWaitLat}ms (lat)`, color:P.cyan,
+                 note:"Max time broker waits to fill fetch.min.bytes. Symmetric to producer linger.ms (F14)."},
+                {param:"receive.buffer.bytes",   dflt:"64 KB",   rec:fmtBytes(calc.consumerReceiveBuffer), color:P.green,
+                 note:`TCP receive buffer, must be ≥ BDP (${fmtBytes(calc.empiricalBDP)}). Defers to OS if set to -1.`},
+              ].map(({param,dflt,rec,color,note}) => (
+                <div key={param} style={{background:P.panel2,border:`1px solid ${color}33`,borderRadius:8,padding:"10px 12px"}}>
+                  <div style={{fontFamily:"monospace",color,fontSize:"0.82em",fontWeight:700,marginBottom:4}}>{param}</div>
+                  <div style={{display:"flex",gap:10,marginBottom:4,flexWrap:"wrap"}}>
+                    <span style={{color:P.red,fontSize:"0.75em"}}>default: {dflt}</span>
+                    <span style={{color:P.green,fontSize:"0.75em"}}>→ {rec}</span>
+                  </div>
+                  <div style={{color:P.muted,fontSize:"0.73em",lineHeight:1.5}}>{note}</div>
+                </div>
+              ))}
+            </div>
+          </Card>
+
+          <Card>
+            <Label c={P.muted} style={{display:"block",marginBottom:10}}>Throughput-Latency Tradeoff (F14)</Label>
+            <div style={{color:P.muted, fontSize:"0.82em", lineHeight:1.7}}>
+              <div style={{marginBottom:8}}>
+                <span style={{color:P.text, fontWeight:600}}>Throughput profile:</span> fetch.min.bytes
+                = {fmtBytes(calc.consumerFetchMinBytes)}, fetch.max.wait.ms = {calc.consumerFetchMaxWaitThru}ms.
+                Broker accumulates data for up to {calc.consumerFetchMaxWaitThru}ms before responding,
+                improving batching and reducing CPU overhead. Best when latency budget &gt; {calc.consumerFetchMaxWaitThru + custom.rttAvg}ms.
+              </div>
+              <div style={{marginBottom:8}}>
+                <span style={{color:P.text, fontWeight:600}}>Latency profile:</span> fetch.min.bytes = 1,
+                fetch.max.wait.ms = {calc.consumerFetchMaxWaitLat}ms. Broker responds immediately when any data
+                is available (min 1 byte), minimizing wait time. Use when end-to-end latency SLA
+                is tight ({custom.latencyBudgetMs}ms budget).
+              </div>
+              <div style={{background:P.panel,border:`1px solid ${P.border}`,borderRadius:6,padding:"8px 10px",marginTop:10}}>
+                <span style={{color:P.accent,fontWeight:600}}>Symmetric to producer:</span> Producer has
+                linger.ms ({calc.lingerThru}ms thru / {calc.lingerLatency}ms lat). Consumer has fetch.max.wait.ms
+                ({calc.consumerFetchMaxWaitThru}ms thru / {calc.consumerFetchMaxWaitLat}ms lat).
+                Both control the batch-vs-latency tradeoff at their respective ends of the pipeline.
+              </div>
+            </div>
+          </Card>
+        </div>
+      )}
+
       {/* Tab: Broker */}
       {tab === "broker" && (
-        <Card>
-          <Label c={P.muted} style={{display:"block",marginBottom:4}}>Broker server.properties additions</Label>
-          <div style={{color:P.muted,fontSize:"0.8em",marginBottom:8}}>
-            Restart broker after applying. Test replication throughput with kafka-producer-perf-test.sh.
-          </div>
-          <CodeBlock>{brokerConf}</CodeBlock>
-          <div style={{marginTop:16, color:P.muted, fontSize:"0.8em", lineHeight:1.7}}>
-            <strong style={{color:P.text}}>Note on socket buffers in broker:</strong> Kafka's broker
-            uses <code style={{color:P.cyan}}>socket.send.buffer.bytes = -1</code> by default, which
-            defers to the OS. Explicitly setting it prevents the OS ceiling from being the silent limit
-            when rmem_max is large but the Kafka config hasn't been updated to match.
-          </div>
-        </Card>
+        <div style={{display:"grid", gap:16}}>
+          <Card>
+            <Label c={P.muted} style={{display:"block",marginBottom:4}}>Broker server.properties additions</Label>
+            <div style={{color:P.muted,fontSize:"0.8em",marginBottom:8}}>
+              Restart broker after applying. Test replication throughput with kafka-producer-perf-test.sh.
+            </div>
+            <CodeBlock>{brokerConf}</CodeBlock>
+          </Card>
+
+          <Card>
+            <Label c={P.muted} style={{display:"block",marginBottom:10}}>Replication configuration explained</Label>
+            <div style={{display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(240px,1fr))", gap:10}}>
+              {[
+                {param:"replica.fetch.max.bytes", dflt:"1 MB", rec:fmtBytes(calc.replicaFetchMaxBytes), color:P.purple,
+                 note:`Should be ≥ producer batch.size (${fmtBytes(calc.batchSize)}) so replicas fetch complete batches.`},
+                {param:"num.replica.fetchers",    dflt:"1",     rec:`${calc.numReplicaFetchers}`, color:P.cyan,
+                 note:`One fetcher per ~6 partitions (${partitions} partitions ÷ 6). More fetchers = better parallelism.`},
+                {param:"replica.lag.time.max.ms", dflt:"10000", rec:`${calc.replicaLagTimeoutMs} ms`, color:P.orange,
+                 note:`Timeout before replica considered out-of-sync. Formula (F15): RTT×4 + fetch.max.wait + 5000ms margin.`},
+                {param:"replica.socket.receive.buffer.bytes", dflt:"-1 (OS)", rec:fmtBytes(calc.replicaSocketReceiveBuffer), color:P.green,
+                 note:`Follower receive buffer when fetching from leader. Must cover BDP (${fmtBytes(calc.empiricalBDP)}).`},
+              ].map(({param,dflt,rec,color,note}) => (
+                <div key={param} style={{background:P.panel2,border:`1px solid ${color}33`,borderRadius:8,padding:"10px 12px"}}>
+                  <div style={{fontFamily:"monospace",color,fontSize:"0.82em",fontWeight:700,marginBottom:4}}>{param}</div>
+                  <div style={{display:"flex",gap:10,marginBottom:4,flexWrap:"wrap"}}>
+                    <span style={{color:P.red,fontSize:"0.75em"}}>default: {dflt}</span>
+                    <span style={{color:P.green,fontSize:"0.75em"}}>→ {rec}</span>
+                  </div>
+                  <div style={{color:P.muted,fontSize:"0.73em",lineHeight:1.5}}>{note}</div>
+                </div>
+              ))}
+            </div>
+          </Card>
+
+          <Card>
+            <Label c={P.muted} style={{display:"block",marginBottom:10}}>Replication bandwidth analysis (per-broker NIC model)</Label>
+            <div style={{display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:10, marginBottom:12}}>
+              <StatBox label="Replication factor" value={`RF=${replicationFactor}`} color={P.red}
+                sub={`${replicationFactor}× write amplification`} />
+              <StatBox label="Per-broker utilization" value={`${calc.perBrokerUtilization}%`}
+                color={calc.perBrokerUtilization > 100 ? P.red : calc.perBrokerUtilization > 80 ? P.yellow : P.green}
+                warn={calc.perBrokerUtilization > 80}
+                sub={`${fmtMbps(calc.perBrokerTotalMbps)} / ${fmtMbps(custom.bwMbps)} limit`} />
+              <StatBox label="Cluster-wide repl BW" value={fmtMbps(calc.replicationWireMbps)} color={P.cyan}
+                sub={`${calc.totalReplicaConnections} follower connections`} />
+            </div>
+            <div style={{color:P.muted, fontSize:"0.82em", lineHeight:1.7}}>
+              <div style={{marginBottom:8}}>
+                <span style={{color:P.text, fontWeight:600}}>Per-broker bandwidth breakdown (F18, F19):</span>
+                Each broker node's NIC must handle producer writes, consumer reads, AND replication in BOTH directions.
+                At {brokers} brokers with {partitions} partitions evenly distributed:
+              </div>
+              <ul style={{marginLeft:16, marginBottom:8, marginTop:4}}>
+                <li>Leader partitions/broker: {calc.leaderPartitionsPerBroker}</li>
+                <li>Follower partitions/broker: {calc.followerPartitionsPerBroker}</li>
+                <li>Producer IN: {fmtMbps(calc.perBrokerProducerIngressMbps)} (writes to this broker's leaders)</li>
+                <li>Replication OUT: {fmtMbps(calc.perBrokerReplicationOutMbps)} (leader → {replicationFactor-1} followers, {replicationFactor-1}× amplification)</li>
+                <li>Replication IN: {fmtMbps(calc.perBrokerReplicationInMbps)} (as follower ← other leaders)</li>
+                <li>Consumer OUT: {fmtMbps(calc.perBrokerConsumerEgressMbps)} (reads from this broker's leaders)</li>
+                <li><strong>Total: {fmtMbps(calc.perBrokerTotalMbps)} ({calc.perBrokerUtilization}% of {fmtMbps(custom.bwMbps)} NIC limit)</strong></li>
+              </ul>
+              <div style={{marginBottom:8}}>
+                <span style={{color:P.text, fontWeight:600}}>Effective replication factor impact:</span>
+                RF={replicationFactor} means each producer write is replicated {replicationFactor-1} times.
+                Leader brokers experience {replicationFactor}× write amplification: 1× producer ingress + {replicationFactor-1}× replication egress.
+                This is why per-broker bandwidth grows with RF even if producer throughput stays constant.
+              </div>
+              <div style={{marginBottom:8}}>
+                <span style={{color:P.text, fontWeight:600}}>Timeout calculation (F15):</span> replica.lag.time.max.ms
+                = {calc.replicaLagTimeoutMs}ms accounts for worst-case fetch cycle: RTT to leader ({custom.rttAvg}ms),
+                broker waits up to fetch.max.wait.ms ({calc.consumerFetchMaxWaitThru}ms) to accumulate data,
+                RTT back to follower ({custom.rttAvg}ms), plus processing overhead and a 5000ms safety margin
+                for GC pauses. Total = {custom.rttAvg}×2 + {calc.consumerFetchMaxWaitThru} + 5000 + headroom ≈ {calc.replicaLagTimeoutMs}ms.
+              </div>
+              <div style={{background:P.panel,border:`1px solid ${P.border}`,borderRadius:6,padding:"8px 10px"}}>
+                <span style={{color:P.accent,fontWeight:600}}>Fetcher parallelism (F16):</span> num.replica.fetchers
+                = {calc.numReplicaFetchers} (one per ~6 partitions). Each fetcher thread handles multiple partitions
+                sequentially. More fetchers improve replication throughput but increase broker thread count and
+                memory. Tune based on partition count and observed replication lag.
+              </div>
+            </div>
+          </Card>
+
+          <Card>
+            <div style={{color:P.muted, fontSize:"0.8em", lineHeight:1.7}}>
+              <strong style={{color:P.text}}>Note on socket buffers in broker:</strong> Kafka's broker
+              uses <code style={{color:P.cyan}}>socket.send.buffer.bytes = -1</code> by default, which
+              defers to the OS. Explicitly setting it prevents the OS ceiling from being the silent limit
+              when rmem_max is large but the Kafka config hasn't been updated to match.
+            </div>
+          </Card>
+        </div>
       )}
 
       {/* Tab: Scenario table */}

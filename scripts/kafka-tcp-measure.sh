@@ -74,6 +74,41 @@ echo "PORT=$PORT"               >> "$META"
 echo "MAX_STREAMS=$MAX_STREAMS" >> "$META"
 echo "TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$META"
 
+# ── MTU detection ─────────────────────────────────────────────────────────────
+detect_mtu() {
+    # Multi-platform MTU detection: ip link (Linux) → ifconfig (macOS/BSD) → netstat (POSIX)
+    # Returns detected MTU or 1500 fallback
+    local target=$1
+    local iface=""
+    local mtu=1500  # fallback
+
+    # Linux: ip route get <target> → dev eth0 → ip link show eth0
+    if command -v ip &>/dev/null; then
+        iface=$(ip route get "$target" 2>/dev/null | grep -o 'dev [^ ]*' | awk '{print $2}')
+        if [[ -n "$iface" ]]; then
+            mtu=$(ip link show "$iface" 2>/dev/null | grep -o 'mtu [0-9]*' | awk '{print $2}')
+        fi
+    # macOS/BSD: route get <target> → interface: en0 → ifconfig en0
+    elif command -v route &>/dev/null && command -v ifconfig &>/dev/null; then
+        iface=$(route get "$target" 2>/dev/null | grep 'interface:' | awk '{print $2}')
+        if [[ -n "$iface" ]]; then
+            mtu=$(ifconfig "$iface" 2>/dev/null | grep -o 'mtu [0-9]*' | awk '{print $2}')
+        fi
+    fi
+
+    # Fallback: netstat -i (POSIX) — find largest MTU from active interfaces
+    if [[ -z "$mtu" || "$mtu" == "0" ]]; then
+        mtu=$(netstat -i 2>/dev/null | awk 'NR>2 && $2 ~ /^[0-9]+$/ {print $2}' | sort -rn | head -1)
+    fi
+
+    # Default to 1500 if all detection failed
+    echo "${mtu:-1500}"
+}
+
+DETECTED_MTU=$(detect_mtu "$TARGET")
+info "Detected interface MTU: $DETECTED_MTU bytes (to $TARGET)"
+echo "DETECTED_MTU=$DETECTED_MTU" >> "$META"
+
 # ── Helper: extract iperf3 JSON field ─────────────────────────────────────────
 iperf_extract() {
     # $1=json_file, $2=python_expression
@@ -229,9 +264,84 @@ echo "PLATEAU_WIN=$PLATEAU_WIN" >> "$META"
 echo "BANDWIDTH_MBPS=$PREV_MBPS" >> "$META"
 
 # =============================================================================
+# PHASE 2.5 — MSS Verification (capture negotiated MSS from active connection)
+# =============================================================================
+section "Phase 2.5/5 — Negotiated MSS Capture"
+
+MSS_CAPTURE_CSV="$OUTDIR/mss_capture.csv"
+echo "timestamp,remote_host,local_mss,remote_mss,rcv_ssthresh,snd_cwnd" > "$MSS_CAPTURE_CSV"
+
+# Check if ss command is available (Linux only)
+if command -v ss &>/dev/null; then
+    info "Starting brief iperf3 connection to capture TCP state..."
+    TMP_JSON=$(mktemp)
+
+    # Start iperf3 in background, capture PID, run for 5 seconds only
+    $IPERF_CMD -c "$TARGET" -p "$PORT" -t 5 -J > "$TMP_JSON" 2>/dev/null &
+    IPERF_PID=$!
+    sleep 2  # Let connection establish
+
+    # Capture ss output while iperf is running
+    # ss -tin: TCP, internal details, numeric
+    SS_OUT=$(ss -tin dst "$TARGET" 2>/dev/null || true)
+
+    # Parse MSS from ss output using python3
+    # Example ss line format:
+    #   tcp ESTAB 0 0 192.168.1.2:54321 broker:5201
+    #        cubic wscale:7,7 rto:204 rtt:4/2 mss:1460 rcvmss:1460 advmss:1460
+    #        cwnd:10 ssthresh:7 bytes_sent:123456
+    read -r LOCAL_MSS REMOTE_MSS RCV_SSTHRESH SND_CWND <<< \
+        "$(python3 - << 'PYEOF'
+import re, sys
+text = """$SS_OUT"""
+mss_m = re.search(r'\bmss:(\d+)', text)
+rcvmss_m = re.search(r'\brcvmss:(\d+)', text)
+ssthresh_m = re.search(r'\bssthresh:(\d+)', text)
+cwnd_m = re.search(r'\bcwnd:(\d+)', text)
+
+local_mss = mss_m.group(1) if mss_m else "0"
+remote_mss = rcvmss_m.group(1) if rcvmss_m else "0"
+ssthresh = ssthresh_m.group(1) if ssthresh_m else "0"
+cwnd = cwnd_m.group(1) if cwnd_m else "0"
+
+print(local_mss, remote_mss, ssthresh, cwnd)
+PYEOF
+        )"
+
+    # Wait for iperf to finish
+    wait $IPERF_PID 2>/dev/null || true
+    rm -f "$TMP_JSON" "${TMP_JSON}.err"
+
+    TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    echo "$TIMESTAMP,$TARGET,$LOCAL_MSS,$REMOTE_MSS,$RCV_SSTHRESH,$SND_CWND" >> "$MSS_CAPTURE_CSV"
+
+    echo "NEGOTIATED_MSS=$LOCAL_MSS" >> "$META"
+    echo "REMOTE_MSS=$REMOTE_MSS" >> "$META"
+
+    if [[ "$LOCAL_MSS" != "0" ]]; then
+        ok "Negotiated MSS: $LOCAL_MSS bytes (remote: $REMOTE_MSS bytes)"
+
+        # Calculate expected MSS from detected MTU
+        EXPECTED_MSS=$((DETECTED_MTU - 40))
+
+        if [[ "$LOCAL_MSS" -lt "$EXPECTED_MSS" ]]; then
+            warn "Negotiated MSS ($LOCAL_MSS) < expected from MTU ($EXPECTED_MSS)"
+            warn "Possible causes: path MTU constraint, MSS clamping, tunnel encapsulation"
+        fi
+    else
+        warn "Could not capture negotiated MSS (connection too brief or ss parsing failed)"
+    fi
+else
+    warn "ss command not available (macOS/BSD) — skipping MSS capture"
+    echo "NEGOTIATED_MSS=0" >> "$META"
+    echo "REMOTE_MSS=0" >> "$META"
+    LOCAL_MSS=0
+fi
+
+# =============================================================================
 # PHASE 3 — Parallel streams sweep (at plateau window)
 # =============================================================================
-section "Phase 3/4 — Parallel streams sweep"
+section "Phase 3/5 — Parallel streams sweep"
 info "Using window=${PLATEAU_WIN} bytes (plateau), sweeping 1..${MAX_STREAMS} streams"
 
 echo "streams,window_bytes,throughput_mbps,retransmits,cpu_sender_pct,cpu_recv_pct" > "$PARALLEL_CSV"
@@ -268,7 +378,7 @@ done
 # =============================================================================
 # PHASE 4 — Nagle comparison (TCP_NODELAY effect)
 # =============================================================================
-section "Phase 4/4 — Nagle / TCP_NODELAY comparison"
+section "Phase 4/5 — Nagle / TCP_NODELAY comparison"
 echo "mode,window_bytes,throughput_mbps,retransmits" > "$NODELAY_CSV"
 
 for NODELAY in 0 1; do
@@ -297,6 +407,59 @@ for NODELAY in 0 1; do
 done
 
 # =============================================================================
+# PHASE 5 — Path MTU Discovery Test (optional — requires ICMP echo)
+# =============================================================================
+section "Phase 5/5 — Path MTU Discovery Test"
+
+# Check if tracepath is available
+if command -v tracepath &>/dev/null; then
+    info "Running tracepath to detect path MTU (requires ICMP echo)..."
+    TRACEPATH_OUT=$(mktemp)
+
+    # tracepath outputs "pmtu XXXX" on last line if successful
+    # Run tracepath and capture last 10 lines for analysis
+    if tracepath -n "$TARGET" 2>/dev/null | tee "$TRACEPATH_OUT" | tail -10 >/dev/null; then
+        PATH_MTU=$(grep -o 'pmtu [0-9]*' "$TRACEPATH_OUT" | tail -1 | awk '{print $2}')
+        if [[ -n "$PATH_MTU" && "$PATH_MTU" != "0" ]]; then
+            ok "Path MTU to $TARGET: $PATH_MTU bytes"
+            echo "PATH_MTU=$PATH_MTU" >> "$META"
+
+            if [[ "$PATH_MTU" -lt "$DETECTED_MTU" ]]; then
+                warn "Path MTU ($PATH_MTU) < interface MTU ($DETECTED_MTU)"
+                warn "Traffic will be fragmented or MSS-clamped by intermediate router"
+            fi
+        else
+            info "Could not determine path MTU (ICMP may be filtered)"
+            echo "PATH_MTU=0" >> "$META"
+        fi
+    else
+        info "tracepath failed — skipping path MTU test"
+        echo "PATH_MTU=0" >> "$META"
+    fi
+    rm -f "$TRACEPATH_OUT"
+
+# Fallback: try ping with DF bit (Linux only)
+elif command -v ping &>/dev/null; then
+    info "tracepath not available — attempting PMTUD with ping -M do..."
+    # ping -M do: set DF bit, find largest size that doesn't fragment
+    # This is Linux-specific; macOS/BSD use -D flag differently
+    PMTU_SIZE=$DETECTED_MTU
+
+    # Try to ping with packet size = MTU - 28 bytes (8 ICMP + 20 IP header)
+    if ping -c 1 -M do -s $((PMTU_SIZE - 28)) "$TARGET" &>/dev/null; then
+        ok "Path supports MTU $PMTU_SIZE (no fragmentation with DF bit set)"
+        echo "PATH_MTU=$PMTU_SIZE" >> "$META"
+    else
+        warn "Packets with MTU $PMTU_SIZE are fragmented or dropped (PMTUD may be broken)"
+        info "Recommend manual path MTU test: tracepath $TARGET"
+        echo "PATH_MTU=0" >> "$META"
+    fi
+else
+    info "No PMTUD test tools available (tracepath, ping -M). Skipping."
+    echo "PATH_MTU=0" >> "$META"
+fi
+
+# =============================================================================
 # DONE
 # =============================================================================
 section "Measurement complete"
@@ -306,7 +469,11 @@ echo "  ping.csv             → RTT baseline"
 echo "  window_sweep.csv     → throughput vs window size"
 echo "  parallel_sweep.csv   → throughput vs stream count"
 echo "  nodelay_comparison   → Nagle effect"
-echo "  meta.env             → extracted key values"
+echo "  mss_capture.csv      → negotiated MSS from active connection"
+echo "  meta.env             → extracted key values (includes MTU/MSS)"
+echo ""
+echo -e "${BOLD}Detected MTU:${RESET}      $DETECTED_MTU bytes"
+echo -e "${BOLD}Negotiated MSS:${RESET}   ${LOCAL_MSS:-unknown} bytes"
 echo ""
 echo -e "${BOLD}Next step:${RESET}"
-echo "  ./kafka-tcp-analyze.sh -d $OUTDIR"
+echo "  ./kafka-tcp-analyze.sh -d $OUTDIR -m $DETECTED_MTU"

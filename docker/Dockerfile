@@ -11,10 +11,10 @@
 #   3001 — TCP Throughput Explainer
 #   3002 — Kafka TCP Tuning
 #
-# Build:
-#   docker build -t tcp-kafka-viz .        (from docker/ directory)
-#   podman build -t tcp-kafka-viz .
-#   buildah bud   -t tcp-kafka-viz .
+# Build (from repository root):
+#   docker build -f docker/Dockerfile -t tcp-kafka-viz .
+#   podman build -f docker/Dockerfile -t tcp-kafka-viz .
+#   buildah bud  -f docker/Dockerfile -t tcp-kafka-viz .
 #
 # Run:
 #   docker run -p 3001:3001 -p 3002:3002 tcp-kafka-viz
@@ -26,21 +26,25 @@ FROM node:22-alpine AS build
 
 WORKDIR /build
 
+# Copy dashboard source files (single source of truth, imported by main.jsx)
+# Build context is repository root, so dashboards/ is at root level
+COPY dashboards/              dashboards/
+
 # Build TCP app
-COPY tcp/package.json         tcp/
-COPY tcp/vite.config.js       tcp/
-COPY tcp/index.html           tcp/
-COPY tcp/src/                 tcp/src/
+COPY docker/tcp/package.json         tcp/
+COPY docker/tcp/vite.config.js       tcp/
+COPY docker/tcp/index.html           tcp/
+COPY docker/tcp/src/                 tcp/src/
 
 RUN cd tcp \
  && npm install --prefer-offline --no-audit --no-fund \
  && npm run build
 
 # Build Kafka app
-COPY kafka/package.json       kafka/
-COPY kafka/vite.config.js     kafka/
-COPY kafka/index.html         kafka/
-COPY kafka/src/               kafka/src/
+COPY docker/kafka/package.json       kafka/
+COPY docker/kafka/vite.config.js     kafka/
+COPY docker/kafka/index.html         kafka/
+COPY docker/kafka/src/               kafka/src/
 
 RUN cd kafka \
  && npm install --prefer-offline --no-audit --no-fund \
@@ -54,9 +58,9 @@ FROM alpine:3.20
 RUN apk add --no-cache busybox-extras \
  && mkdir -p /srv/tcp /srv/kafka
 
-COPY --from=build /build/tcp/dist/   /srv/tcp/
-COPY --from=build /build/kafka/dist/ /srv/kafka/
-COPY scripts/entrypoint.sh           /entrypoint.sh
+COPY --from=build /build/tcp/dist/        /srv/tcp/
+COPY --from=build /build/kafka/dist/      /srv/kafka/
+COPY docker/scripts/entrypoint.sh         /entrypoint.sh
 
 RUN chmod +x /entrypoint.sh
 

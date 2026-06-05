@@ -28,6 +28,7 @@ spec:
               echo "Before:"
               sysctl net.core.rmem_max net.core.wmem_max \
                      net.core.rmem_default net.core.wmem_default \
+                     net.ipv4.tcp_window_scaling \
                      net.ipv4.tcp_congestion_control \
                      net.core.default_qdisc
 
@@ -44,6 +45,7 @@ spec:
               echo "After:"
               sysctl net.core.rmem_max net.core.wmem_max \
                      net.core.rmem_default net.core.wmem_default \
+                     net.ipv4.tcp_window_scaling \
                      net.ipv4.tcp_congestion_control \
                      net.core.default_qdisc
       containers:

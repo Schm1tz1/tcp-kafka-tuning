@@ -1,6 +1,8 @@
 services:
   viz:
-    build: .
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
     image: tcp-kafka-viz:latest
     ports:
       - "3001:3001"   # TCP Throughput Explainer

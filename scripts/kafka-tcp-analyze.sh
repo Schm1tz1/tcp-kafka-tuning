@@ -86,6 +86,9 @@ while IFS='=' read -r key val; do
         PKT_LOSS)       PKT_LOSS="$val"        ;;
         PLATEAU_WIN)    PLATEAU_WIN="$val"     ;;
         BANDWIDTH_MBPS) BANDWIDTH_MBPS="$val"  ;;
+        DETECTED_MTU)   DETECTED_MTU="$val"    ;;
+        NEGOTIATED_MSS) NEGOTIATED_MSS="$val"  ;;
+        PATH_MTU)       PATH_MTU="$val"        ;;
         # Ignore any other keys — do not blindly export unknown variables
     esac
 done < <(parse_env "$RESULTS_DIR/meta.env")
@@ -96,6 +99,15 @@ RTT_MDEV=${RTT_MDEV:-0.5}
 PKT_LOSS=${PKT_LOSS:-0}
 PLATEAU_WIN=${PLATEAU_WIN:-131072}
 BANDWIDTH_MBPS=${BANDWIDTH_MBPS:-1000}
+DETECTED_MTU=${DETECTED_MTU:-0}
+NEGOTIATED_MSS=${NEGOTIATED_MSS:-0}
+PATH_MTU=${PATH_MTU:-0}
+
+# If MTU not specified via -m flag and DETECTED_MTU available, use it
+if [[ "$MTU" == "1500" && "$DETECTED_MTU" != "0" ]]; then
+    MTU=$DETECTED_MTU
+    info "Using detected MTU from measurement: $MTU bytes"
+fi
 
 # ── Validate all inputs are numeric before passing to python3 ─────────────────
 is_numeric() {
@@ -127,6 +139,7 @@ python3 - \
     "$PLATEAU_WIN" "$BANDWIDTH_MBPS" "$PARALLEL_CONNS" \
     "$MTU" "$INFLIGHT" "$LATENCY_BUDGET_MS" \
     "$RESULTS_DIR" \
+    "$DETECTED_MTU" "$NEGOTIATED_MSS" "$PATH_MTU" \
     << 'PYEOF'
 import math, sys
 
@@ -139,6 +152,9 @@ mtu       = int(sys.argv[8])
 inflight  = int(sys.argv[9])
 lat_ms    = float(sys.argv[10])
 results_dir = sys.argv[11]
+detected_mtu   = int(sys.argv[12]) if len(sys.argv) > 12 else 0
+negotiated_mss = int(sys.argv[13]) if len(sys.argv) > 13 else 0
+path_mtu       = int(sys.argv[14]) if len(sys.argv) > 14 else 0
 
 bw_bytes  = bw_mbps * 1e6 / 8
 rtt_s_min = rtt_min / 1000
@@ -182,6 +198,52 @@ if pkt_loss > 0:
 
 # Jitter flag
 high_jitter = rtt_mdev > (rtt_avg * 0.3)
+
+# ── MTU/MSS diagnostics ─────────────────────────────────────────────────────
+mss_diagnostics = []
+
+# Determine effective MSS
+mss_effective = mss  # default: calculated from MTU
+
+if negotiated_mss > 0 and negotiated_mss != mss:
+    mss_diagnostics.append(
+        f"WARNING: Negotiated MSS ({negotiated_mss}B) differs from MTU-derived MSS ({mss}B). "
+        f"Possible MSS clamping or tunnel encapsulation."
+    )
+    mss_effective = negotiated_mss
+
+if path_mtu > 0 and path_mtu < mtu:
+    mss_diagnostics.append(
+        f"WARNING: Path MTU ({path_mtu}B) < interface MTU ({mtu}B). "
+        f"Intermediate router will fragment or clamp MSS. Effective MSS: {path_mtu - 40}B."
+    )
+    mss_effective = path_mtu - 40
+
+if mtu == 9000 or mtu == 9001 or mtu == 8896:
+    mss_diagnostics.append(
+        f"INFO: Jumbo frames enabled (MTU {mtu}). Verify end-to-end path supports jumbo frames. "
+        f"Internet egress will be clamped to MTU 1500."
+    )
+
+if mtu > 1500 and path_mtu == 1500:
+    mss_diagnostics.append(
+        f"ERROR: Interface MTU is {mtu} (jumbo) but path MTU is 1500. "
+        f"Path does NOT support jumbo frames. Reduce interface MTU or enable MSS clamping."
+    )
+
+# Fragmentation analysis
+segments_per_batch = math.ceil(batch_size / mss_effective)
+kafka_overhead_per_batch = segments_per_batch * 75  # 61 + 14 bytes Kafka headers
+effective_payload_pct = ((batch_size - kafka_overhead_per_batch) / batch_size) * 100
+
+if batch_size < mss_effective * 2:
+    mss_diagnostics.append(
+        f"WARNING: batch.size ({batch_size}B) < 2×MSS ({mss_effective * 2}B). "
+        f"Batches are smaller than 2 full frames — underutilizing MTU capacity."
+    )
+
+# Packets per MB calculation
+packets_per_mb = math.ceil(1048576 / mss_effective)
 
 # ── Scenario presets ────────────────────────────────────────────────────────
 scenarios = {
@@ -239,6 +301,13 @@ with open(f"{results_dir}/analysis.env", "w") as f:
     f.write(f"HIGH_JITTER={'1' if high_jitter else '0'}\n")
     f.write(f"DIAGNOSIS={'|'.join(diagnosis)}\n")
     f.write(f"BUF_POW2={buf_pow2}\n")
+    # MTU/MSS metrics
+    f.write(f"MSS_EFFECTIVE={mss_effective}\n")
+    f.write(f"SEGMENTS_PER_BATCH={segments_per_batch}\n")
+    f.write(f"KAFKA_OVERHEAD_PER_BATCH={kafka_overhead_per_batch}\n")
+    f.write(f"EFFECTIVE_PAYLOAD_PCT={effective_payload_pct:.1f}\n")
+    f.write(f"PACKETS_PER_MB={packets_per_mb}\n")
+    f.write(f"MSS_DIAGNOSTICS={'|'.join(mss_diagnostics)}\n")
 PYEOF
 
 # Load analysis.env safely — same parser, explicit allowlist of expected keys
@@ -257,6 +326,12 @@ while IFS='=' read -r key val; do
         HIGH_JITTER)     HIGH_JITTER="$val"     ;;
         DIAGNOSIS)       DIAGNOSIS="$val"       ;;
         BUF_POW2)        BUF_POW2="$val"        ;;
+        MSS_EFFECTIVE)            MSS_EFFECTIVE="$val"            ;;
+        SEGMENTS_PER_BATCH)       SEGMENTS_PER_BATCH="$val"       ;;
+        KAFKA_OVERHEAD_PER_BATCH) KAFKA_OVERHEAD_PER_BATCH="$val" ;;
+        EFFECTIVE_PAYLOAD_PCT)    EFFECTIVE_PAYLOAD_PCT="$val"    ;;
+        PACKETS_PER_MB)           PACKETS_PER_MB="$val"           ;;
+        MSS_DIAGNOSTICS)          MSS_DIAGNOSTICS="$val"          ;;
     esac
 done < <(parse_env "$RESULTS_DIR/analysis.env")
 
@@ -298,6 +373,32 @@ done
 
 if [[ "${HIGH_JITTER}" == "1" ]]; then
     warn "High jitter detected — verify switch QoS and enable FQ qdisc before tuning buffers"
+fi
+
+# ── MTU/MSS Diagnostics ───────────────────────────────────────────────────────
+section "MTU/MSS Diagnostics"
+kv "Configured MTU:"        "$MTU bytes"
+kv "Calculated MSS:"        "$MSS bytes (MTU - 40)"
+[[ "$NEGOTIATED_MSS" != "0" ]] && kv "Negotiated MSS:"      "$NEGOTIATED_MSS bytes (captured from active connection)"
+[[ "$PATH_MTU" != "0" ]] && kv "Path MTU:"              "$PATH_MTU bytes (detected via PMTUD)"
+kv "Effective MSS:"         "${MSS_EFFECTIVE} bytes (used for calculations)"
+echo ""
+kv "Segments per batch:"    "$SEGMENTS_PER_BATCH"
+kv "Kafka header overhead:" "${KAFKA_OVERHEAD_PER_BATCH} bytes (${EFFECTIVE_PAYLOAD_PCT}% payload)"
+kv "Packets per MB:"        "$PACKETS_PER_MB"
+
+# Display MSS diagnostics if any
+if [[ -n "$MSS_DIAGNOSTICS" ]]; then
+    echo ""
+    IFS='|' read -ra MSS_DIAG_ITEMS <<< "$MSS_DIAGNOSTICS"
+    for item in "${MSS_DIAG_ITEMS[@]}"; do
+        [[ -z "$item" ]] && continue
+        case "$item" in
+            *ERROR*)   error "$item" ;;
+            *WARNING*) warn  "$item" ;;
+            *)         info  "$item" ;;
+        esac
+    done
 fi
 
 # ── Nagle comparison ──────────────────────────────────────────────────────────
