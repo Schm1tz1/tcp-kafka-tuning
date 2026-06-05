@@ -165,7 +165,9 @@ function calcFromMeasurements({bwMbps, rttMin, rttAvg, plateauKB, conns, mtu, in
 
   // num.replica.fetchers: one fetcher thread can handle ~4-8 partitions efficiently.
   // More fetchers = higher parallelism but more broker connections and threads.
-  const numReplicaFetchers = Math.max(1, Math.ceil(partitions / 6));
+  // In multi-region clusters (MRC) with high RTT, increase to 2-3 to avoid replication lag.
+  const baseReplicaFetchers = Math.max(1, Math.ceil(partitions / 6));
+  const numReplicaFetchers = rttAvg > 50 ? Math.max(baseReplicaFetchers, 2) : baseReplicaFetchers;
 
   // replica.lag.time.max.ms (F15): timeout before a replica is considered out-of-sync.
   // Must account for: fetch round-trip (RTT×2), broker processing, fetch.max.wait.ms,
@@ -236,16 +238,22 @@ function calcFromMeasurements({bwMbps, rttMin, rttAvg, plateauKB, conns, mtu, in
   // With partition assignment, each consumer connects to subset of brokers
   const perBrokerConsumerConns = Math.min(consumerCount, Math.ceil(consumerCount * (leaderPartitionsPerBroker / partitions)));
 
-  // Replica fetcher connections IN (followers fetching from this broker's leaders)
-  // Each follower partition creates 1 connection to the leader
-  const perBrokerReplicaFetcherConnsIn = leaderPartitionsPerBroker * (replicationFactor - 1);
+  // Replica fetcher connections: each broker runs num.replica.fetchers threads,
+  // and each thread connects to every OTHER broker (brokers - 1).
+  // Total outgoing connections = num.replica.fetchers × (brokers - 1)
+  const perBrokerReplicaFetcherConnsOut = numReplicaFetchers * Math.max(0, brokers - 1);
 
-  // Replica fetcher connections OUT (this broker fetching as follower)
-  // num.replica.fetchers threads, each handles ~6 partitions (F16)
-  const perBrokerReplicaFetcherConnsOut = Math.ceil(followerPartitionsPerBroker / 6);
+  // Incoming: each of the other brokers connects with num.replica.fetchers threads
+  const perBrokerReplicaFetcherConnsIn = numReplicaFetchers * Math.max(0, brokers - 1);
 
   const perBrokerTotalConns = perBrokerProducerConns + perBrokerConsumerConns +
                                perBrokerReplicaFetcherConnsIn + perBrokerReplicaFetcherConnsOut;
+
+  // num.network.threads: handles all I/O (producer, consumer, replication, inter-broker)
+  // Rule of thumb: 1 thread per ~50 connections, minimum 8, scale up for large clusters
+  // For replication alone: need at least (brokers - 1) × num.replica.fetchers
+  const minNetworkThreadsForReplication = Math.max(0, brokers - 1) * numReplicaFetchers;
+  const numNetworkThreads = Math.max(8, Math.ceil(perBrokerTotalConns / 50), minNetworkThreadsForReplication);
 
   // Total replication bandwidth (cluster-wide, for reference)
   const totalReplicaConnections = partitions * (replicationFactor - 1);
@@ -286,6 +294,7 @@ function calcFromMeasurements({bwMbps, rttMin, rttAvg, plateauKB, conns, mtu, in
           // Replication settings
           replicaFetchMaxBytes, numReplicaFetchers, replicaLagTimeoutMs,
           replicaSocketReceiveBuffer, totalReplicaConnections, replicationWireMbps,
+          numNetworkThreads,
           // Per-broker analysis (F18, F19)
           brokers, partitionsPerBroker, leaderPartitionsPerBroker, followerPartitionsPerBroker,
           perBrokerProducerIngressMbps, perBrokerReplicationOutMbps,
@@ -721,18 +730,27 @@ delivery.timeout.ms                   = 10000`;
 
   const brokerConf = `# Broker server.properties additions
 # ── Network I/O buffers ────────────────────────────────────────────────────
-socket.send.buffer.bytes              = ${calc.bufCeil}
-socket.receive.buffer.bytes           = ${calc.bufCeil}
-num.network.threads                   = 8
+# PRIMARY: Use OS-level TCP buffer tuning (see sysctl tab) — allows auto-tuning
+# Fallback if OS-level tuning is not possible (uncomment):
+#socket.send.buffer.bytes              = ${calc.bufCeil}
+#socket.receive.buffer.bytes           = ${calc.bufCeil}
 
-# ── Replication (RF=${replicationFactor}, ${partitions} partitions = ${calc.totalReplicaConnections} follower connections) ───────
+# Network threads: handles producer, consumer, replication, and inter-broker I/O
+# Calculated: ${calc.perBrokerTotalConns} total connections / 50 per thread
+# Minimum for replication: ${brokers} brokers × ${calc.numReplicaFetchers} fetchers = ${Math.max(0, brokers - 1) * calc.numReplicaFetchers}
+num.network.threads                   = ${calc.numNetworkThreads}
+
+# ── Replication (RF=${replicationFactor}, ${partitions} partitions, ${brokers} brokers) ───────
 replica.fetch.max.bytes               = ${calc.replicaFetchMaxBytes}
-replica.socket.receive.buffer.bytes   = ${calc.replicaSocketReceiveBuffer}
+# Fallback if OS-level tuning not possible (uncomment):
+#replica.socket.receive.buffer.bytes   = ${calc.replicaSocketReceiveBuffer}
+
+# Fetcher threads: ${calc.numReplicaFetchers} threads × ${Math.max(0, brokers - 1)} other brokers = ${calc.perBrokerReplicaFetcherConnsOut} outgoing connections
+# Scaled up for high-RTT (${custom.rttAvg}ms) to avoid replication lag in MRC
 num.replica.fetchers                  = ${calc.numReplicaFetchers}
+
 replica.lag.time.max.ms               = ${calc.replicaLagTimeoutMs}
-# Reasoning: timeout = RTT×4 (${custom.rttAvg*4}ms) + fetch.max.wait (${calc.consumerFetchMaxWaitThru}ms) + 5000ms margin
-# At ${partitions} partitions, RF=${replicationFactor}: ${calc.totalReplicaConnections} follower fetcher connections
-# Estimated replication bandwidth: ${fmtMbps(calc.replicationWireMbps)} (capped at 50% link capacity)`;
+# Timeout = RTT×4 (${custom.rttAvg*4}ms) + fetch.max.wait (${calc.consumerFetchMaxWaitThru}ms) + 5000ms margin`;
 
   const measureScript = `#!/bin/bash
 # 1. Start iperf3 server on broker:
@@ -1930,13 +1948,15 @@ receive.buffer.bytes                  = ${calc.consumerReceiveBuffer}
           </Card>
 
           <Card>
-            <Label c={P.muted} style={{display:"block",marginBottom:10}}>Replication configuration explained</Label>
+            <Label c={P.muted} style={{display:"block",marginBottom:10}}>Broker configuration explained</Label>
             <div style={{display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(240px,1fr))", gap:10}}>
               {[
+                {param:"num.network.threads",     dflt:"3",     rec:`${calc.numNetworkThreads}`, color:P.accent,
+                 note:`Handles all I/O: ${calc.perBrokerTotalConns} total connections (${calc.perBrokerProducerConns} prod + ${calc.perBrokerConsumerConns} cons + ${calc.perBrokerReplicaFetcherConnsIn + calc.perBrokerReplicaFetcherConnsOut} repl). Rule: 1 thread per ~50 connections, min 8.`},
                 {param:"replica.fetch.max.bytes", dflt:"1 MB", rec:fmtBytes(calc.replicaFetchMaxBytes), color:P.purple,
                  note:`Should be ≥ producer batch.size (${fmtBytes(calc.batchSize)}) so replicas fetch complete batches.`},
                 {param:"num.replica.fetchers",    dflt:"1",     rec:`${calc.numReplicaFetchers}`, color:P.cyan,
-                 note:`One fetcher per ~6 partitions (${partitions} partitions ÷ 6). More fetchers = better parallelism.`},
+                 note:`Base: 1 fetcher per ~6 partitions (${partitions} ÷ 6). Scaled to ${calc.numReplicaFetchers} for RTT=${custom.rttAvg}ms. Each broker: ${calc.numReplicaFetchers} threads × ${Math.max(0, brokers - 1)} other brokers = ${calc.perBrokerReplicaFetcherConnsOut} connections.`},
                 {param:"replica.lag.time.max.ms", dflt:"10000", rec:`${calc.replicaLagTimeoutMs} ms`, color:P.orange,
                  note:`Timeout before replica considered out-of-sync. Formula (F15): RTT×4 + fetch.max.wait + 5000ms margin.`},
                 {param:"replica.socket.receive.buffer.bytes", dflt:"-1 (OS)", rec:fmtBytes(calc.replicaSocketReceiveBuffer), color:P.green,
