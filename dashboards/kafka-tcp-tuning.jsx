@@ -704,35 +704,26 @@ compression.type                      = lz4
 max.in.flight.requests.per.connection = ${inflight}
 acks                                  = all
 enable.idempotence                    = true
-send.buffer.bytes                     = ${calc.batchSize * 2}
-receive.buffer.bytes                  = 65536
-retries                               = 10
-retry.backoff.ms                      = 100
-delivery.timeout.ms                   = 120000`;
+send.buffer.bytes                     = ${calc.batchSize * 2}  # Fallback if OS tcp_wmem cannot be set`;
 
   const kafkaLatConf = `# LATENCY profile (budget: ${custom.latencyBudgetMs}ms)
 # RTT: ${custom.rttAvg}ms → linger headroom: ${calc.lingerLatency}ms
 # WARNING: acks=1 + enable.idempotence=false trades durability/ordering for latency.
 # Use acks=all + enable.idempotence=true if message ordering or durability is required.
 
-batch.size                            = 16384
 linger.ms                             = ${calc.lingerLatency}
 compression.type                      = lz4
 max.in.flight.requests.per.connection = 1
 acks                                  = 1
 enable.idempotence                    = false
 request.timeout.ms                    = 5000
-delivery.timeout.ms                   = 10000
-retries                               = 3
-retry.backoff.ms                      = 50`;
+delivery.timeout.ms                   = 10000`;
 
   const brokerConf = `# Broker server.properties additions
 # ── Network I/O buffers ────────────────────────────────────────────────────
 socket.send.buffer.bytes              = ${calc.bufCeil}
 socket.receive.buffer.bytes           = ${calc.bufCeil}
-socket.request.max.bytes              = 104857600
 num.network.threads                   = 8
-num.io.threads                        = 8
 
 # ── Replication (RF=${replicationFactor}, ${partitions} partitions = ${calc.totalReplicaConnections} follower connections) ───────
 replica.fetch.max.bytes               = ${calc.replicaFetchMaxBytes}
@@ -973,7 +964,7 @@ sudo sysctl --system`;
         {[
           ["overview","Overview"],["throughput","Throughput"],["bbr","BBR vs CUBIC"],
           ["mtu","MTU Impact"],["sysctl","sysctl"],
-          ["kafka","Kafka Props"],["consumer","Consumer"],["broker","Broker"],
+          ["kafka","Producer"],["consumer","Consumer"],["broker","Broker"],
           ["table","Scenarios"],["scripts","Scripts"],
         ].map(([id,lbl])=>(
           <TabBtn key={id} active={tab===id} onClick={()=>setTab(id)}>{lbl}</TabBtn>
@@ -1870,7 +1861,6 @@ receive.buffer.bytes                  = ${calc.consumerReceiveBuffer}
 # - receive.buffer.bytes = ${fmtBytes(calc.consumerReceiveBuffer)} covers BDP×conns×2
 
 # ── Latency profile (minimize wait time) ───────────────────────────────────
-fetch.min.bytes                       = 1
 fetch.max.wait.ms                     = ${calc.consumerFetchMaxWaitLat}
 max.partition.fetch.bytes             = ${calc.consumerFetchMaxBytes}
 receive.buffer.bytes                  = ${calc.consumerReceiveBuffer}
