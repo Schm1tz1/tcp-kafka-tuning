@@ -7,4 +7,5 @@ services:
     ports:
       - "3001:3001"   # TCP Throughput Explainer
       - "3002:3002"   # Kafka TCP Tuning
+      - "3003:3003"   # Guided Slideshow
     restart: unless-stopped

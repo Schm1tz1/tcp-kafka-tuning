@@ -67,6 +67,7 @@
 
     .card.tcp:hover  { border-color: #3b82f6; box-shadow: 0 0 0 1px #3b82f640; transform: translateY(-2px); }
     .card.kafka:hover { border-color: #f59e0b; box-shadow: 0 0 0 1px #f59e0b40; transform: translateY(-2px); }
+    .card.slides:hover { border-color: #a371f7; box-shadow: 0 0 0 1px #a371f740; transform: translateY(-2px); }
 
     .card-graphic {
       border-radius: 8px;
@@ -83,8 +84,9 @@
       font-weight: 600;
     }
 
-    .card.tcp   h2 { color: #79c0ff; }
-    .card.kafka h2 { color: #fbbf24; }
+    .card.tcp    h2 { color: #79c0ff; }
+    .card.kafka  h2 { color: #fbbf24; }
+    .card.slides h2 { color: #d2a8ff; }
 
     .card p {
       color: #8b949e;
@@ -116,8 +118,9 @@
       border: 1px solid;
     }
 
-    .card.tcp   .tag { color: #60a5fa; border-color: #1d3a6e; background: #0a1628; }
-    .card.kafka .tag { color: #fbbf24; border-color: #451a03; background: #1a0e00; }
+    .card.tcp    .tag { color: #60a5fa; border-color: #1d3a6e; background: #0a1628; }
+    .card.kafka  .tag { color: #fbbf24; border-color: #451a03; background: #1a0e00; }
+    .card.slides .tag { color: #d2a8ff; border-color: #3c1e70; background: #160a26; }
 
     .cta {
       display: inline-flex;
@@ -131,8 +134,9 @@
       transition: opacity 0.15s;
     }
 
-    .card.tcp   .cta { background: #0f2544; color: #79c0ff; border: 1px solid #1d3a6e; }
-    .card.kafka .cta { background: #2a1700; color: #fbbf24; border: 1px solid #451a03; }
+    .card.tcp    .cta { background: #0f2544; color: #79c0ff; border: 1px solid #1d3a6e; }
+    .card.kafka  .cta { background: #2a1700; color: #fbbf24; border: 1px solid #451a03; }
+    .card.slides .cta { background: #1c1033; color: #d2a8ff; border: 1px solid #3c1e70; }
     .card:hover .cta { opacity: 0.85; }
 
     footer {
@@ -162,6 +166,64 @@
 
 <main>
   <div class="cards">
+
+    <!-- Guided Slideshow -->
+    <a href="./slides/" class="card slides">
+      <div class="card-graphic">
+        <svg viewBox="0 0 440 190" xmlns="http://www.w3.org/2000/svg">
+          <rect width="440" height="190" fill="#0d1117"/>
+
+          <!-- Pipe outline -->
+          <rect x="60" y="68" width="320" height="54" rx="27" fill="#0d1117" stroke="#a371f7" stroke-width="2"/>
+
+          <!-- Packets in flight filling the pipe -->
+          <rect x="74"  y="80" width="26" height="30" rx="4" fill="#a371f7" opacity="0.9"/>
+          <rect x="108" y="80" width="26" height="30" rx="4" fill="#a371f7" opacity="0.78"/>
+          <rect x="142" y="80" width="26" height="30" rx="4" fill="#a371f7" opacity="0.66"/>
+          <rect x="176" y="80" width="26" height="30" rx="4" fill="#a371f7" opacity="0.54"/>
+          <rect x="210" y="80" width="26" height="30" rx="4" fill="#a371f7" opacity="0.42"/>
+          <rect x="244" y="80" width="26" height="30" rx="4" fill="#a371f7" opacity="0.3"/>
+
+          <!-- Diameter arrow = bandwidth -->
+          <line x1="44" y1="68" x2="44" y2="122" stroke="#4ade80" stroke-width="1.5"/>
+          <polygon points="40,74 44,68 48,74" fill="#4ade80"/>
+          <polygon points="40,116 44,122 48,116" fill="#4ade80"/>
+          <text x="26" y="98" fill="#4ade80" font-size="9" font-family="monospace" text-anchor="middle" transform="rotate(-90,26,98)">bandwidth</text>
+
+          <!-- Length arrow = RTT -->
+          <line x1="60" y1="140" x2="380" y2="140" stroke="#fbbf24" stroke-width="1.5"/>
+          <polygon points="66,136 60,140 66,144" fill="#fbbf24"/>
+          <polygon points="374,136 380,140 374,144" fill="#fbbf24"/>
+          <text x="220" y="156" fill="#fbbf24" font-size="9" font-family="monospace" text-anchor="middle">round-trip time (RTT)</text>
+
+          <!-- BDP caption -->
+          <text x="220" y="52" fill="#d2a8ff" font-size="11" font-family="monospace" text-anchor="middle">data in flight = bandwidth × RTT  (BDP)</text>
+
+          <!-- Slide progress dots -->
+          <rect x="186" y="172" width="22" height="8" rx="4" fill="#a371f7"/>
+          <circle cx="220" cy="176" r="4" fill="#30363d"/>
+          <circle cx="236" cy="176" r="4" fill="#30363d"/>
+          <circle cx="252" cy="176" r="4" fill="#30363d"/>
+
+          <!-- Title -->
+          <text x="60" y="28" fill="#d2a8ff" font-size="13" font-family="monospace" font-weight="bold">Start here →</text>
+        </svg>
+      </div>
+
+      <h2>Guided Slideshow</h2>
+
+      <p>New to TCP tuning? Start with the interactive walkthrough. Twelve slides build intuition for the four numbers that cap throughput — <code>RTT</code>, bandwidth, <code>BDP</code>, and the TCP window — then trace them up into Kafka producer batches and partitions. Live sliders and order-of-magnitude examples (a 64&nbsp;KB window wastes 99% of a 10&nbsp;Gbps cross-region link) make the effects concrete. Concepts here; the math in the explainer.</p>
+
+      <div class="tags">
+        <span class="tag">Overview</span>
+        <span class="tag">Pipe analogy</span>
+        <span class="tag">BDP</span>
+        <span class="tag">Interactive sliders</span>
+        <span class="tag">Orders of magnitude</span>
+      </div>
+
+      <span class="cta">Open slideshow →</span>
+    </a>
 
     <!-- TCP Throughput Explainer -->
     <a href="./tcp/" class="card tcp">

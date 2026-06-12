@@ -13,12 +13,17 @@ echo "Starting Kafka TCP Tuning on http://0.0.0.0:3002"
 httpd -f -p 3002 -h /srv/kafka &
 KAFKA_PID=$!
 
+echo "Starting Guided Slideshow on http://0.0.0.0:3003"
+httpd -f -p 3003 -h /srv/slides &
+SLIDES_PID=$!
+
 echo ""
-echo "Both apps running:"
+echo "All apps running:"
 echo "  TCP explainer : http://<host>:3001/"
 echo "  Kafka tuning  : http://<host>:3002/"
+echo "  Slideshow     : http://<host>:3003/"
 echo ""
 
-trap 'kill $TCP_PID $KAFKA_PID 2>/dev/null; exit 0' TERM INT
+trap 'kill $TCP_PID $KAFKA_PID $SLIDES_PID 2>/dev/null; exit 0' TERM INT
 
-wait $TCP_PID $KAFKA_PID
+wait $TCP_PID $KAFKA_PID $SLIDES_PID

@@ -33,12 +33,19 @@ jobs:
           VITE_BASE: /tcp-kafka-tuning/kafka/
         run: npm install && npm run build
 
+      - name: Build Slideshow app
+        working-directory: docker/slides
+        env:
+          VITE_BASE: /tcp-kafka-tuning/slides/
+        run: npm install && npm run build
+
       - name: Assemble dist/
         run: |
-          mkdir -p dist/tcp dist/kafka
-          cp -r docker/tcp/dist/*   dist/tcp/
-          cp -r docker/kafka/dist/* dist/kafka/
-          cp static/index.html      dist/index.html
+          mkdir -p dist/tcp dist/kafka dist/slides
+          cp -r docker/tcp/dist/*    dist/tcp/
+          cp -r docker/kafka/dist/*  dist/kafka/
+          cp -r docker/slides/dist/* dist/slides/
+          cp static/index.html       dist/index.html
 
       - uses: peaceiris/actions-gh-pages@v4
         with:

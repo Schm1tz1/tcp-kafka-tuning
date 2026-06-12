@@ -8,7 +8,7 @@ Project context for Claude Code. Read this before making any changes.
 
 **TCP Kafka Tuning** is a measurement-driven configuration reference for TCP/IP and Apache Kafka throughput optimisation. It consists of:
 
-- Two interactive React dashboards (Vite + recharts)
+- Three interactive React apps (Vite + recharts): two detailed dashboards plus a concept-level guided slideshow
 - Two shell scripts for network measurement and analysis
 - A Kubernetes deployment manifest
 - A full technical reference document
@@ -23,7 +23,8 @@ The project is grounded in published network performance theory: Little's Law [1
 ```
 ├── dashboards/
 │   ├── tcp-throughput-explainer.jsx   # TCP theory explainer — standalone
-│   └── kafka-tcp-tuning.jsx           # Kafka tuning dashboard — standalone
+│   ├── kafka-tcp-tuning.jsx           # Kafka tuning dashboard — standalone
+│   └── tcp-kafka-slideshow.jsx        # Guided concept slideshow — standalone
 │
 ├── scripts/
 │   ├── kafka-tcp-measure.sh           # ping + iperf3 window sweep → CSV output
@@ -40,13 +41,19 @@ The project is grounded in published network performance theory: Little's Law [1
 │   │   ├── vite.config.js             # base path + resolve.dedupe for out-of-root import
 │   │   ├── index.html
 │   │   └── src/
-│   │       └── main.jsx               # imports ../../../dashboards/tcp-throughput-explainer.jsx
-│   └── kafka/
+│   │       └── main.jsx               # imports @dashboards/tcp-throughput-explainer.jsx
+│   ├── kafka/
+│   │   ├── package.json
+│   │   ├── vite.config.js             # base path + resolve.dedupe for out-of-root import
+│   │   ├── index.html
+│   │   └── src/
+│   │       └── main.jsx               # imports @dashboards/kafka-tcp-tuning.jsx
+│   └── slides/
 │       ├── package.json
 │       ├── vite.config.js             # base path + resolve.dedupe for out-of-root import
 │       ├── index.html
 │       └── src/
-│           └── main.jsx               # imports ../../../dashboards/kafka-tcp-tuning.jsx
+│           └── main.jsx               # imports @dashboards/tcp-kafka-slideshow.jsx
 │
 ├── docs/
 │   ├── kafka-tcp-tuning-guide.md      # full technical reference (537 lines, 10 sections)
@@ -62,7 +69,7 @@ The project is grounded in published network performance theory: Little's Law [1
 
 ### Single source of truth
 
-`dashboards/tcp-throughput-explainer.jsx` and `dashboards/kafka-tcp-tuning.jsx` are the **only** copies of the dashboard code. The Vite projects in `docker/tcp/` and `docker/kafka/` import them directly via a relative path in `main.jsx` — there are no `App.jsx` files inside `docker/*/src/`.
+`dashboards/tcp-throughput-explainer.jsx`, `dashboards/kafka-tcp-tuning.jsx`, and `dashboards/tcp-kafka-slideshow.jsx` are the **only** copies of the app code. The Vite projects in `docker/tcp/`, `docker/kafka/`, and `docker/slides/` import them directly via the `@dashboards` alias in `main.jsx` — there are no `App.jsx` files inside `docker/*/src/`.
 
 `vite.config.js` in each project sets `resolve.dedupe` for `react`, `react-dom`, and `recharts` so that Vite resolves those packages from the project's own `node_modules` even though the source file lives outside the project root. `server.fs.allow` permits the dev server to serve the out-of-root file.
 
@@ -256,8 +263,8 @@ Returns: `empiricalBDP`, `theoreticalBDP`, `mss`, `bufCeil`, `batchSize`, `batch
 
 - **Build stage:** `node:22-alpine` — Vite builds both apps
 - **Runtime stage:** `alpine:3.20` + `busybox-extras` — serves via `httpd` (NOT `busybox httpd`)
-- **Ports:** 3001 (TCP explainer), 3002 (Kafka tuning)
-- **Entrypoint:** `/entrypoint.sh` starts two `httpd -f -p <port> -h /srv/<app>` processes
+- **Ports:** 3001 (TCP explainer), 3002 (Kafka tuning), 3003 (slideshow)
+- **Entrypoint:** `/entrypoint.sh` starts three `httpd -f -p <port> -h /srv/<app>` processes
 - **Build context:** Repository root (so Dockerfile can access `dashboards/`)
 
 ```bash
@@ -270,8 +277,8 @@ docker build -f docker/Dockerfile -t tcp-kafka-viz .
 docker-compose -f docker/docker-compose.yml build
 
 # Run
-podman run -p 3001:3001 -p 3002:3002 tcp-kafka-viz
-docker run -p 3001:3001 -p 3002:3002 tcp-kafka-viz
+podman run -p 3001:3001 -p 3002:3002 -p 3003:3003 tcp-kafka-viz
+docker run -p 3001:3001 -p 3002:3002 -p 3003:3003 tcp-kafka-viz
 ```
 
 ---
@@ -280,14 +287,17 @@ docker run -p 3001:3001 -p 3002:3002 tcp-kafka-viz
 
 ```bash
 # Dev server (hot reload)
-cd docker/tcp   && npm install && npm run dev   # → http://localhost:5173
-cd docker/kafka && npm install && npm run dev   # → http://localhost:5174
+cd docker/tcp    && npm install && npm run dev   # → http://localhost:5173
+cd docker/kafka  && npm install && npm run dev   # → http://localhost:5174
+cd docker/slides && npm install && npm run dev   # → http://localhost:5175
 
 # Static build + serve
-cd docker/tcp   && npm install && npm run build
-cd docker/kafka && npm install && npm run build
-python3 -m http.server 3001 --directory docker/tcp/dist   &
-python3 -m http.server 3002 --directory docker/kafka/dist &
+cd docker/tcp    && npm install && npm run build
+cd docker/kafka  && npm install && npm run build
+cd docker/slides && npm install && npm run build
+python3 -m http.server 3001 --directory docker/tcp/dist    &
+python3 -m http.server 3002 --directory docker/kafka/dist  &
+python3 -m http.server 3003 --directory docker/slides/dist &
 # or
 npx serve -l 3001 docker/tcp/dist
 npx serve -l 3002 docker/kafka/dist
@@ -299,11 +309,10 @@ npx serve -l 3002 docker/kafka/dist
 
 ## Open Items / Next Steps
 
-1. **GitHub Pages deployment** — not yet set up. Requires:
-   - `vite.config.js` `base` now reads `process.env.VITE_BASE ?? '/'` — set `VITE_BASE=/tcp-kafka-tuning/tcp/` (or `/kafka/`) in the CI build step
-   - Add `.github/workflows/deploy.yml` (GitHub Actions build + deploy)
-   - Built output goes to `docs/tcp/` and `docs/kafka/`
-   - Enable Pages in repo Settings → Pages → Source: GitHub Actions
+1. **GitHub Pages deployment** — live via GitHub Actions (`peaceiris/actions-gh-pages`), publishing to the `gh-pages` branch:
+   - `.github/workflows/deploy-tcp_tools.yml` — `main` branch → site root. Builds tcp/kafka/slides with `VITE_BASE=/tcp-kafka-tuning/<app>/`, assembles `dist/{tcp,kafka,slides}` + `dist/index.html` (from `static/index.html`).
+   - `.github/workflows/deploy-uat.yml` — `uat` branch → `/uat/` subpath (`VITE_BASE=/tcp-kafka-tuning/uat/<app>/`, `destination_dir: uat`).
+   - **Adding a new app:** add a build step (with its `VITE_BASE`) AND a copy line in the "Assemble dist/" step of BOTH workflows, or it deploys as a broken link.
 
 2. **Slider component naming inconsistency** — `tcp-throughput-explainer.jsx` uses `SliderField({val, set, fmt})` while `kafka-tcp-tuning.jsx` uses `Slider({value, onChange, unit})`. These should be unified if sharing components.
 

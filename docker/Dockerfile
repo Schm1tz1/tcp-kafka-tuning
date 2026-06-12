@@ -10,6 +10,7 @@
 # Ports:
 #   3001 — TCP Throughput Explainer
 #   3002 — Kafka TCP Tuning
+#   3003 — Guided Slideshow
 #
 # Build (from repository root):
 #   docker build -f docker/Dockerfile -t tcp-kafka-viz .
@@ -50,20 +51,31 @@ RUN cd kafka \
  && npm install --prefer-offline --no-audit --no-fund \
  && npm run build
 
+# Build Slideshow app
+COPY docker/slides/package.json      slides/
+COPY docker/slides/vite.config.js    slides/
+COPY docker/slides/index.html        slides/
+COPY docker/slides/src/              slides/src/
+
+RUN cd slides \
+ && npm install --prefer-offline --no-audit --no-fund \
+ && npm run build
+
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
 # busybox-extras ships the httpd applet and installs as /usr/sbin/httpd.
 # Call it as 'httpd' directly — NOT 'busybox httpd' (that form fails on Alpine).
 FROM alpine:3.20
 
 RUN apk add --no-cache busybox-extras \
- && mkdir -p /srv/tcp /srv/kafka
+ && mkdir -p /srv/tcp /srv/kafka /srv/slides
 
 COPY --from=build /build/tcp/dist/        /srv/tcp/
 COPY --from=build /build/kafka/dist/      /srv/kafka/
+COPY --from=build /build/slides/dist/     /srv/slides/
 COPY docker/scripts/entrypoint.sh         /entrypoint.sh
 
 RUN chmod +x /entrypoint.sh
 
-EXPOSE 3001 3002
+EXPOSE 3001 3002 3003
 
 ENTRYPOINT ["/entrypoint.sh"]
