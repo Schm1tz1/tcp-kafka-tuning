@@ -88,7 +88,7 @@ Self-contained React app (no external state, no API calls). Structure:
 - `LogToggle` / `ChartHeader` — log-Y axis toggle button + chart header row
 - `yAxisProps(logScale, minVal, labelText)` — returns recharts YAxis props
 - `BdpCalc` — interactive BDP calculator with two SliderField controls
-- `BbrComparison` — full BBR vs CUBIC simulation with 4 charts + behaviour table
+- `CongestionCompetition` — competing congestion control simulation: competitor selector (BBR/PCC/Hybla/Cubic) vs a default Cubic flow over a shared bottleneck, computed Jain fairness per phase, 4 charts + measured-results table from Zhao et al. (2022)
 - `SectionHeading`, `Mono`, `Formula`, `Tag` — layout primitives
 
 **Data generators** (pure functions, no state):
@@ -97,7 +97,7 @@ Self-contained React app (no external state, no API calls). Structure:
 - `cwndData()` — TCP Reno sawtooth simulation (RFC 5681)
 - `mathisData()` — Mathis bound T = MSS/(RTT×√p)/125000 Mbps
 - `throughputVsRtt()` — T=W/RTT for RTT 1–500ms, 5 window sizes
-- `simBbrVsCubic(bwMbps, rttMs, bufMss)` — 70-round BBR/CUBIC simulation
+- `simCompetition(competitor, bwMbps, rttMs, bufMss)` — 70-round shared-bottleneck competition (competitor vs default Cubic); returns rows + per-phase Jain fairness. Paired with `competitorMeta()` for algorithm metadata + measured paper results
 
 **Sections:**
 1. Pipe Analogy — BDP chart + new throughput-vs-RTT chart (paired)
@@ -108,10 +108,10 @@ Self-contained React app (no external state, no API calls). Structure:
 5. Mathis Equation — loss-limited throughput chart
 6. Quick Reference Scenarios table
 7. **Interactive Linux Tuning Calculator** — scenario dropdown, sliders for bandwidth/RTT/MTU/packet loss, calculates BDP and buffer sizes, generates sysctl config dynamically with recommendations (BBR vs CUBIC, jumbo frames, diagnostics for loss-limited/low-BDP/high-BDP scenarios)
-8. BBR vs CUBIC — interactive simulation (4 charts + table)
+8. **Competing Congestion Control** — competitor selector (BBR/PCC/Hybla/Cubic) competing with a default Cubic flow over a shared bottleneck; computed Jain fairness (start-up/steady/overall) + 4 charts + measured results from Zhao et al. (2022)
 9. References & Standards (15 clickable entries)
 
-**Log-Y state:** `logBdp`, `logTputRtt`, `logWin`, `logRtt`, `logCwnd`, `logMath` in App; `logCwnd`, `logRtt2`, `logQueue`, `logTput` inside `BbrComparison`.
+**Log-Y state:** `logBdp`, `logTputRtt`, `logWin`, `logRtt`, `logCwnd`, `logMath` in App; `logCwnd`, `logRtt2`, `logQueue`, `logTput` inside `CongestionCompetition` (which also holds `competitor` selector state).
 
 **Interactive tuning calculator state (Section 7):**
 - `tuningScenario`, `tuningBw`, `tuningRtt`, `tuningMtu`, `tuningLoss`
@@ -156,7 +156,7 @@ Returns: `empiricalBDP`, `theoreticalBDP`, `mss`, `bufCeil`, `batchSize`, `batch
 
 **Data generators:**
 - `simWindowSweep(bwMbps, rttMs)` — plateau detection for overview chart
-- `simBbrVsCubic(bwMbps, rttMs, bufMss)` — 70-round BBR/CUBIC simulation
+- `simCompetition(competitor, bwMbps, rttMs, bufMss)` — 70-round shared-bottleneck competition (competitor vs default Cubic); returns rows + per-phase Jain fairness. Paired with `competitorMeta()` for algorithm metadata + measured paper results
 
 **Tabs:** `overview`, `throughput`, `bbr`, `mtu`, `sysctl`, `kafka`, `consumer`, `broker`, `table`, `scripts`
 
@@ -225,6 +225,8 @@ Returns: `empiricalBDP`, `theoreticalBDP`, `mss`, `bufCeil`, `batchSize`, `batch
 | F18 | `write_amplification = RF` | Replication I/O | Leader NIC sees RF× writes |
 | F19 | `producer + consumer + repl_in + repl_out ≤ NIC_limit` | Per-broker constraint | Cloud VM bandwidth cap |
 | F20 | `MSS_eff = min(MTU_vpc, MTU_internet) − 40` | Cloud egress constraint | Hybrid cloud/internet paths |
+| F21 | `f = (Σxᵢ)² / (n·Σxᵢ²)` | Jain (1984); Zhao et al. 2022 | Jain's fairness index — competing-CC sim |
+| H1/H2 | `cwnd ×= 2^ρ` (SS), `cwnd += ρ²` (CA), `ρ = RTT/RTT₀` | Caini & Firrincieli 2004 | Hybla RTT-compensated growth (RTT₀=25ms) |
 
 ---
 

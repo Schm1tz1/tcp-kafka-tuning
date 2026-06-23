@@ -654,7 +654,68 @@ function ExampleSlide() {
   );
 }
 
-// 12 ── Go deeper ────────────────────────────────────────────────────────────
+// 12 ── Competing congestion control ─────────────────────────────────────────
+function CongestionSlide() {
+  const algos = [
+    { id:"cubic", name:"Cubic", c:P.accent, kind:"loss-based",
+      vs:"Fair to itself — two Cubic flows split evenly.", jain:0.99 },
+    { id:"bbr",   name:"BBR",   c:P.green,  kind:"bandwidth-est",
+      vs:"Ignores loss → dominates Cubic in every phase.", jain:0.55 },
+    { id:"pcc",   name:"PCC",   c:P.purple, kind:"utility-fn",
+      vs:"Yields on delay → Cubic dominates it.",          jain:0.85 },
+    { id:"hybla", name:"Hybla", c:P.yellow, kind:"satellite-opt",
+      vs:"Erases RTT bias → wins start-up, fair after.",   jain:0.92 },
+  ];
+  const data = algos.map(a => ({ name:a.name, jain:a.jain, color:a.c }));
+  return (
+    <div>
+      <Lead>
+        A link is never one flow. What matters is how a new algorithm behaves when
+        it <strong>competes</strong> with the deployed default,
+        <span style={{ color:P.accent }}> Cubic</span>. Over a real satellite link,
+        Zhao et al. (2022) measured four — and they share very differently.
+      </Lead>
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(230px,1fr))",
+        gap:12, margin:"14px 0" }}>
+        {algos.map(a => (
+          <div key={a.id} style={{ background:P.panel, border:`1px solid ${a.c}44`,
+            borderRadius:10, padding:"12px 14px" }}>
+            <Pill color={a.c}>{a.name} · {a.kind}</Pill>
+            <p style={{ color:P.muted, fontSize:"0.9em", marginTop:8, lineHeight:1.5 }}>{a.vs}</p>
+          </div>
+        ))}
+      </div>
+      <div style={{ background:P.panel, border:`1px solid ${P.border}`, borderRadius:10,
+        padding:"14px 16px" }}>
+        <div style={{ color:P.muted, fontSize:"0.82em", marginBottom:8 }}>
+          Jain&apos;s fairness index vs Cubic (1 = equal share, ½ = one flow starves the other)
+        </div>
+        <ResponsiveContainer width="100%" height={180}>
+          <BarChart data={data} layout="vertical" margin={{ top:6, right:60, bottom:6, left:20 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#21262d" horizontal={false} />
+            <XAxis type="number" domain={[0.5, 1]} stroke={P.muted} tick={{ fontSize:11 }}
+              ticks={[0.5, 0.75, 1]} />
+            <YAxis type="category" dataKey="name" stroke={P.muted} tick={{ fontSize:11 }} width={70} />
+            <Tooltip contentStyle={tipStyle} formatter={v => [v.toFixed(2), "Jain index"]} />
+            <ReferenceLine x={1} stroke={P.green} strokeDasharray="4 3"
+              label={{ value:"fair", fill:P.green, fontSize:10, position:"top" }} />
+            <Bar dataKey="jain" radius={[0, 4, 4, 0]}
+              label={{ position:"right", fill:P.text, fontSize:11, formatter:v => v.toFixed(2) }}>
+              {data.map((d, i) => <Cell key={i} fill={d.color} />)}
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+      <Note color={P.accent}>
+        The lesson: a faster algorithm in isolation can be a bully or a pushover when
+        sharing a link. The <strong>TCP Throughput Explainer</strong> lets you pit each
+        one against Cubic and watch the split unfold round-trip by round-trip.
+      </Note>
+    </div>
+  );
+}
+
+// 13 ── Go deeper ────────────────────────────────────────────────────────────
 function RecapSlide() {
   const terms = [
     { t:"RTT",        d:"Round-trip latency. Sets the pipe length.", c:P.yellow },
@@ -706,6 +767,7 @@ const SLIDES = [
   { kicker:"From TCP to Kafka",   title:"Producer batches = window",     Body:KafkaSlide },
   { kicker:"Scaling out",         title:"Partitions = parallel pipes",   Body:PartitionsSlide },
   { kicker:"Orders of magnitude", title:"What tuning is worth",          Body:ExampleSlide },
+  { kicker:"Sharing the link",    title:"Competing congestion control",  Body:CongestionSlide },
   { kicker:"Recap",               title:"The whole chain & next steps",  Body:RecapSlide },
 ];
 

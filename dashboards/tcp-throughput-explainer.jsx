@@ -98,84 +98,119 @@ function throughputVsRtt() {
   return rows;
 }
 
-// ─── BBR vs CUBIC simulation ──────────────────────────────────────────────────
-// CUBIC source: Ha, Rhee, Xu (2008) ACM SIGOPS OSR 42(5).
-// BBR source:   Cardwell, Cheng, Gunn, Yeganeh, Jacobson (2016) ACM Queue 14(5).
-// Simulation models key behaviours qualitatively; not a full ns-3/ns-2 trace.
-// CUBIC: loss-triggered AIMD (RFC 5681). RTT inflation via Little's Law queuing.
-// BBR:   BtlBw×RTprop = BDP target; pacing_gain cycle per Cardwell 2016 §4.
-// bwMbps: link bandwidth, rttMs: propagation RTT, bufMss: switch buffer depth
-function simBbrVsCubic(bwMbps, rttMs, bufMss) {
-  const bdpMss  = Math.max(1, Math.round((bwMbps * 1e6 / 8) * (rttMs / 1000) / 1460));
-  const maxCwnd = bdpMss + bufMss;
-  const rows    = [];
+// ─── Competing congestion control simulation ─────────────────────────────────
+// Reproduces the qualitative findings of Zhao, Peters, Chung & Claypool (2022),
+// "Competing TCP Congestion Control Algorithms over a Satellite Network", IEEE
+// CCNC. A selected competitor flow (BBR / PCC / Hybla / Cubic) shares ONE
+// bottleneck with a default Cubic flow. Window dynamics are modelled
+// qualitatively — not a full ns-3 trace — and Jain's fairness is computed per
+// phase (start-up / steady state / overall) so the sim reproduces the paper's
+// headline result: BBR dominates Cubic, Cubic dominates PCC, Hybla dominates
+// start-up but is fair in steady state, and Cubic is fair to another Cubic.
+// CUBIC:  loss-based AIMD, proportional-share decrease (Ha, Rhee, Xu 2008).
+// BBR:    BtlBw×RTprop model, ignores loss (Cardwell et al. 2016).
+// PCC:    Vivace-Latency utility, yields on rising delay (Dong et al. 2018).
+// Hybla:  RTT-compensated growth, ρ=RTT/RTT₀ (Caini & Firrincieli 2004).
+function simCompetition(competitor, bwMbps, rttMs, bufMss) {
+  const ROUNDS = 70, RTT0 = 25, MSS = 1460;
+  const bdpMss   = Math.max(1, Math.round((bwMbps * 1e6 / 8) * (rttMs / 1000) / MSS));
+  const bufLimit = bdpMss + bufMss;
 
-  let cwnd_c   = 2;
-  let ssthresh = Math.round(bdpMss * 1.5);
+  let aCwnd = 2, aSsthresh = Math.round(bdpMss * 1.5), aStart = true;
+  let bCwnd = 2, bSsthresh = Math.round(bdpMss * 1.5);
 
-  let cwnd_b   = bdpMss;
-  let bbrPhase = 0;
-
-  for (let t = 0; t < 70; t++) {
-    // ── CUBIC ─────────────────────────────────────────────────────────────
-    const inFlight_c = Math.min(cwnd_c, maxCwnd);
-    const qDepth_c   = Math.max(0, inFlight_c - bdpMss);
-    const rtt_c      = rttMs + (qDepth_c / Math.max(1, bdpMss)) * rttMs * 2;
-    const tput_c     = Math.min(bwMbps,
-      (inFlight_c * 1460 * 8) / (rtt_c / 1000) / 1e6);
-    const loss_c = inFlight_c >= maxCwnd;
-    if (loss_c) {
-      ssthresh = Math.max(2, Math.floor(cwnd_c / 2));
-      cwnd_c   = ssthresh;
-    } else if (cwnd_c < ssthresh) {
-      cwnd_c = Math.min(cwnd_c * 2, ssthresh);
-    } else {
-      cwnd_c = Math.min(cwnd_c + 1, maxCwnd + 4);
-    }
-
-    // ── BBR ───────────────────────────────────────────────────────────────
-    // 8-round cycle: 7 cruise + 1 probe_up + 1 probe_drain; probe_rtt every 30
-    const cycle = t % 10;
-    if      (t % 30 === 29) bbrPhase = 3;          // probe_rtt — drain to 4 MSS
-    else if (cycle === 8)   bbrPhase = 1;           // probe_bw up  (+25%)
-    else if (cycle === 9)   bbrPhase = 2;           // probe_bw down (drain)
-    else                    bbrPhase = 0;           // steady cruise
-
-    let cwndTarget_b, gainFactor;
-    if      (bbrPhase === 3) { cwndTarget_b = 4;                       gainFactor = 0.1;  }
-    else if (bbrPhase === 1) { cwndTarget_b = Math.round(bdpMss*1.25); gainFactor = 1.25; }
-    else if (bbrPhase === 2) { cwndTarget_b = Math.round(bdpMss*0.75); gainFactor = 0.75; }
-    else                     { cwndTarget_b = bdpMss * 2;              gainFactor = 1.0;  }
-
-    const qDepth_b = bbrPhase === 1 ? Math.round(bdpMss * 0.25) : 0;
-    const rtt_b    = rttMs + (qDepth_b / Math.max(1, bdpMss)) * rttMs * 0.5;
-    const tput_b   = Math.min(bwMbps, bwMbps * gainFactor * (bbrPhase === 3 ? 0.1 : 1.0));
+  const rows = [];
+  for (let t = 0; t < ROUNDS; t++) {
+    const total  = aCwnd + bCwnd;
+    const queue  = Math.max(0, total - bdpMss);            // shared bottleneck queue
+    const over   = total > bufLimit;                       // buffer overflow → loss
+    const rtt    = rttMs * (1 + Math.min(queue, bufMss * 2) / Math.max(1, bdpMss));
+    const sat    = total >= bdpMss;                        // link saturated → share by window
+    const aShare = total > 0 ? aCwnd / total : 0.5;
+    const bShare = total > 0 ? bCwnd / total : 0.5;
+    const aTput  = sat ? bwMbps * aShare : (aCwnd * MSS * 8) / (rtt / 1000) / 1e6;
+    const bTput  = sat ? bwMbps * bShare : (bCwnd * MSS * 8) / (rtt / 1000) / 1e6;
 
     rows.push({
       t,
-      cwnd_cubic:  Math.round(Math.min(inFlight_c, maxCwnd)),
-      rtt_cubic:   +rtt_c.toFixed(1),
-      tput_cubic:  +tput_c.toFixed(1),
-      queue_cubic: qDepth_c,
-      loss_cubic:  loss_c ? Math.round(inFlight_c) : null,
-      cwnd_bbr:    cwndTarget_b,
-      rtt_bbr:     +rtt_b.toFixed(1),
-      tput_bbr:    +tput_b.toFixed(1),
-      queue_bbr:   qDepth_b,
-      bdp:         bdpMss,
-      bufLimit:    maxCwnd,
-      linkRate:    bwMbps,
-      propRtt:     rttMs,
+      cwnd_comp:  Math.round(aCwnd),
+      cwnd_cubic: Math.round(bCwnd),
+      rtt:        +rtt.toFixed(1),
+      queue:      Math.round(queue),
+      tput_comp:  +aTput.toFixed(1),
+      tput_cubic: +bTput.toFixed(1),
+      loss_cubic: over ? Math.round(bCwnd) : null,
+      loss_comp:  (over && competitor !== "bbr") ? Math.round(aCwnd) : null,
     });
+
+    // default CUBIC flow B — proportional-share decrease (AQM drops ∝ throughput)
+    if      (over)              bCwnd = Math.max(2, bCwnd * (1 - 0.5 * bShare));
+    else if (bCwnd < bSsthresh) bCwnd = Math.min(bCwnd * 2, bSsthresh);
+    else                        bCwnd = bCwnd + 1;
+
+    // competitor flow A
+    if (competitor === "cubic") {
+      if      (over)              aCwnd = Math.max(2, aCwnd * (1 - 0.5 * aShare));
+      else if (aCwnd < aSsthresh) aCwnd = Math.min(aCwnd * 2, aSsthresh);
+      else                        aCwnd = aCwnd + 1;
+    } else if (competitor === "hybla") {
+      const rho = Math.max(1, Math.min(rtt / RTT0, 24));   // RTT-compensation factor
+      if      (over)              aCwnd = Math.max(2, aCwnd * (1 - 0.5 * aShare));
+      else if (aCwnd < aSsthresh) aCwnd = Math.min(aCwnd * Math.pow(2, rho), bufLimit + 4); // SS ×2^ρ
+      else                        aCwnd = Math.min(aCwnd + rho * rho,        bufLimit + 4); // CA +ρ²
+    } else if (competitor === "bbr") {
+      if      (aStart)        { aCwnd *= 2; if (aCwnd >= 2 * bdpMss) aStart = false; }       // startup gain
+      else if (t % 30 === 29) aCwnd = Math.max(4, Math.round(bdpMss * 0.5));                 // probe_rtt
+      else                    aCwnd = Math.min(aCwnd + Math.max(1, Math.round(bdpMss * 0.1)), 2 * bdpMss);
+    } else if (competitor === "pcc") {
+      if      (aStart)               { aCwnd *= 2; if (aCwnd >= bdpMss) aStart = false; }
+      else if (queue > 0.02 * bdpMss) aCwnd = Math.max(2, aCwnd * 0.88);                     // latency penalty
+      else                            aCwnd = aCwnd + Math.max(1, Math.round(bdpMss * 0.02));// probe up
+    }
   }
-  return { rows, bdpMss, maxCwnd };
+
+  const jain = (rs) => {
+    const a = rs.reduce((s, r) => s + r.tput_comp,  0) / rs.length;
+    const b = rs.reduce((s, r) => s + r.tput_cubic, 0) / rs.length;
+    const f = (a + b) > 0 ? ((a + b) ** 2) / (2 * (a * a + b * b)) : 1;
+    return { f: +f.toFixed(2), comp: +a.toFixed(0), cubic: +b.toFixed(0) };
+  };
+  const fairness = {
+    startup: jain(rows.slice(0, 10)),
+    steady:  jain(rows.slice(35)),
+    overall: jain(rows),
+  };
+  return { rows, fairness, bdpMss, bufLimit };
 }
 
-// ─── BBR Interactive Component ────────────────────────────────────────────────
-function BbrComparison() {
-  const [bw,  setBw]  = useState(1000);   // Mbps
-  const [rtt, setRtt] = useState(20);     // ms
-  const [buf, setBuf] = useState(50);     // switch buffer in MSS
+// Algorithm metadata + measured results from Zhao et al. (2022) Fig 7.
+// fair = Jain's index [start-up, steady, overall]; diff = overall throughput
+// difference vs Cubic in Mb/s (+ Cubic gets more, − competitor gets more).
+function competitorMeta(P) {
+  return {
+    bbr:   { name:"BBR",   color:P.green,  tag:"bandwidth-est",
+      blurb:"Models BtlBw×RTprop and ignores packet loss. It ramps past Cubic and holds ~2×BDP, so Cubic's loss-driven backoff cedes the link — BBR dominates both start-up and steady state.",
+      fair:[0.93,0.53,0.55], diff:-91.61, note:"BBR dominates Cubic in both phases (disregards loss)" },
+    pcc:   { name:"PCC",   color:P.purple, tag:"utility-fn",
+      blurb:"The Vivace-Latency utility penalises rising delay, so PCC reduces its rate whenever the queue builds. Cubic ignores delay and fills the buffer to loss, so Cubic dominates steady state.",
+      fair:[0.98,0.85,0.85], diff:43.97,  note:"Cubic dominates PCC in steady state (PCC cuts rate on delay)" },
+    hybla: { name:"Hybla", color:P.yellow, tag:"satellite-opt",
+      blurb:"Scales window growth by ρ=RTT/RTT₀ to erase RTT bias. On high-latency paths it fills the pipe almost instantly — dominating start-up — then behaves like loss-based TCP and shares fairly in steady state.",
+      fair:[0.51,0.99,0.92], diff:-33.21, note:"Hybla dominates start-up, fair in steady state" },
+    cubic: { name:"Cubic", color:P.accent, tag:"loss-based",
+      blurb:"A second default Cubic flow — the fairness baseline. Two Cubic flows share the bottleneck equally in every phase (Jain ≈ 1.0).",
+      fair:[1.00,0.99,0.99], diff:7.31,   note:"Fair to another Cubic flow in all phases" },
+  };
+}
+
+// ─── Competing Congestion Control Interactive Component ───────────────────────
+const fairColor = f => f >= 0.9 ? P.green : f >= 0.7 ? P.yellow : P.red;
+
+function CongestionCompetition() {
+  const [competitor, setCompetitor] = useState("bbr");
+  const [bw,  setBw]  = useState(144);    // Mbps — satellite-scale default (paper testbed)
+  const [rtt, setRtt] = useState(600);    // ms
+  const [buf, setBuf] = useState(80);     // switch buffer in MSS
 
   // Per-chart log scale toggles
   const [logCwnd,  setLogCwnd]  = useState(false);
@@ -183,18 +218,12 @@ function BbrComparison() {
   const [logQueue, setLogQueue] = useState(false);
   const [logTput,  setLogTput]  = useState(false);
 
-  const { rows, bdpMss, maxCwnd } = simBbrVsCubic(bw, rtt, buf);
+  const ALGOS = competitorMeta(P);
+  const algo  = ALGOS[competitor];
 
-  const avgCubicTput  = +(rows.reduce((s,r)=>s+r.tput_cubic,0)/rows.length).toFixed(1);
-  const avgBbrTput    = +(rows.reduce((s,r)=>s+r.tput_bbr,0)/rows.length).toFixed(1);
-  const avgCubicRtt   = +(rows.reduce((s,r)=>s+r.rtt_cubic,0)/rows.length).toFixed(1);
-  const avgBbrRtt     = +(rows.reduce((s,r)=>s+r.rtt_bbr,0)/rows.length).toFixed(1);
-  const avgCubicQueue = +(rows.reduce((s,r)=>s+r.queue_cubic,0)/rows.length).toFixed(1);
-  const lossEvents    = rows.filter(r=>r.loss_cubic!==null).length;
-  const tputGain      = avgCubicTput > 0
-    ? +(((avgBbrTput - avgCubicTput) / avgCubicTput) * 100).toFixed(0) : 0;
-  const rttReduction  = avgCubicRtt  > 0
-    ? +(((avgCubicRtt  - avgBbrRtt)  / avgCubicRtt)  * 100).toFixed(0) : 0;
+  const { rows, fairness, bdpMss, bufLimit } = simCompetition(competitor, bw, rtt, buf);
+  const compLossEvents = rows.filter(r => r.loss_comp  !== null).length;
+  const cubicLossEvents = rows.filter(r => r.loss_cubic !== null).length;
 
   const grid = <CartesianGrid strokeDasharray="3 3" stroke="#21262d" />;
   const xAx  = <XAxis dataKey="t" stroke={P.muted} tick={{fontSize:10}}
@@ -204,16 +233,35 @@ function BbrComparison() {
 
   return (
     <div>
-      {/* Sliders */}
+      {/* Competitor selector */}
       <div style={{background:P.panel, border:`1px solid ${P.border}`, borderRadius:10,
         padding:"18px 20px", margin:"16px 0"}}>
         <div style={{color:P.muted, fontSize:"0.78em", fontWeight:600,
-          letterSpacing:"0.08em", textTransform:"uppercase", marginBottom:14}}>
-          Simulation Parameters
+          letterSpacing:"0.08em", textTransform:"uppercase", marginBottom:12}}>
+          Algorithm competing against default Cubic
         </div>
-        <div style={{display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))", gap:20}}>
+        <div style={{display:"flex", gap:8, flexWrap:"wrap", marginBottom:14}}>
+          {Object.entries(ALGOS).map(([id, a]) => (
+            <button key={id} onClick={() => setCompetitor(id)}
+              style={{background: competitor===id ? a.color+"22" : "transparent",
+                color: competitor===id ? a.color : P.muted,
+                border:`1px solid ${competitor===id ? a.color+"88" : P.border}`,
+                borderRadius:7, padding:"7px 16px", cursor:"pointer",
+                fontWeight:700, fontSize:"0.86em", transition:"all 0.15s"}}>
+              {a.name} <span style={{fontSize:"0.78em", opacity:0.7, fontWeight:500}}>{a.tag}</span>
+            </button>
+          ))}
+        </div>
+        <div style={{color:P.text, fontSize:"0.84em", lineHeight:1.65,
+          borderLeft:`3px solid ${algo.color}`, paddingLeft:12}}>
+          <strong style={{color:algo.color}}>{algo.name}</strong> vs Cubic — {algo.blurb}
+        </div>
+
+        {/* Sliders */}
+        <div style={{display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",
+          gap:20, marginTop:18}}>
           {[
-            {label:"Bandwidth", val:bw,  set:setBw,  min:10,  max:50000, step:10,
+            {label:"Bottleneck bandwidth", val:bw,  set:setBw,  min:10,  max:50000, step:10,
               fmt: v => v>=1000?`${(v/1000).toFixed(v%1000===0?0:1)} Gbps`:`${v} Mbps`, color:P.accent},
             {label:"RTT (propagation)", val:rtt, set:setRtt, min:1, max:600, step:1,
               fmt: v=>`${v} ms`, color:P.green},
@@ -228,10 +276,9 @@ function BbrComparison() {
         <div style={{display:"flex", gap:16, marginTop:14, flexWrap:"wrap"}}>
           {[
             {label:"BDP", value:`${bdpMss} MSS`, color:P.accent},
-            {label:"Buffer limit", value:`${maxCwnd} MSS (BDP + ${buf} MSS)`, color:P.yellow},
-            {label:"BBR throughput gain", value:`+${tputGain}%`, color:P.green},
-            {label:"RTT reduction", value:`${rttReduction}%`, color:P.cyan},
-            {label:"CUBIC loss events", value:`${lossEvents}`, color:P.red},
+            {label:"Buffer limit", value:`${bufLimit} MSS (BDP + ${buf} MSS)`, color:P.yellow},
+            {label:`${algo.name} avg throughput`, value:`${fairness.overall.comp} Mbps`, color:algo.color},
+            {label:"Cubic avg throughput", value:`${fairness.overall.cubic} Mbps`, color:P.red},
           ].map(({label,value,color}) => (
             <div key={label} style={{background:"#0d1117", borderRadius:7,
               padding:"6px 12px", border:`1px solid ${color}33`}}>
@@ -244,14 +291,39 @@ function BbrComparison() {
         </div>
       </div>
 
+      {/* Jain fairness (computed from simulation) */}
+      <div style={{background:P.panel, border:`1px solid ${P.border}`, borderRadius:10,
+        padding:"16px 20px", margin:"12px 0"}}>
+        <div style={{color:P.muted, fontSize:"0.78em", fontWeight:600,
+          letterSpacing:"0.08em", textTransform:"uppercase", marginBottom:4}}>
+          Jain&apos;s fairness index — computed from this simulation
+        </div>
+        <div style={{color:P.muted, fontSize:"0.78em", marginBottom:12, lineHeight:1.5}}>
+          f(x₁,x₂) = (x₁+x₂)² / 2(x₁²+x₂²) — ranges ½ (one flow starves the other)
+          to 1 (perfectly equal share). Start-up = first 10 RTTs, steady = last half.
+        </div>
+        <div style={{display:"flex", gap:14, flexWrap:"wrap"}}>
+          {[["Start-up",fairness.startup.f],["Steady state",fairness.steady.f],["Overall",fairness.overall.f]]
+            .map(([label,f])=>(
+            <div key={label} style={{flex:"1 1 120px", background:"#0d1117", borderRadius:8,
+              padding:"10px 14px", border:`1px solid ${fairColor(f)}44`}}>
+              <div style={{color:P.muted, fontSize:"0.72em", textTransform:"uppercase",
+                letterSpacing:"0.05em"}}>{label}</div>
+              <div style={{color:fairColor(f), fontFamily:"monospace", fontWeight:800,
+                fontSize:"1.4em"}}>{f.toFixed(2)}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
       {/* Chart 1: cwnd */}
       <div style={{background:P.panel, border:`1px solid ${P.border}`, borderRadius:10,
         padding:"18px 16px", margin:"12px 0"}}>
         <ChartHeader title="Congestion window (cwnd) — MSS" logY={logCwnd} setLogY={setLogCwnd} />
         <div style={{color:P.muted, fontSize:"0.79em", marginBottom:10, lineHeight:1.6}}>
-          CUBIC climbs exponentially until it overflows the buffer, then halves — the sawtooth.
-          BBR holds at 2×BDP in cruise; briefly probes at 1.25× every 8 RTTs to test for
-          more bandwidth. Red dots = CUBIC loss events (required signal).
+          Both flows share one bottleneck. Watch how {algo.name}&apos;s window grows relative
+          to the default Cubic flow — divergence here is what drives the throughput split.
+          Dots mark loss (buffer-overflow) events.
         </div>
         <ResponsiveContainer width="100%" height={220}>
           <LineChart data={rows} margin={{top:4,right:24,bottom:20,left:10}}>
@@ -259,32 +331,32 @@ function BbrComparison() {
             <YAxis {...yAxisProps(logCwnd, 0.5, "cwnd (MSS)", {tick:{fontSize:10}, label:{...yAxisProps(logCwnd,0.5,"cwnd (MSS)").label, fontSize:10, dx:-6}})} />
             <Tooltip contentStyle={tipStyle}
               formatter={(v,n)=>[typeof v==="number"?`${v} MSS`:v, n]} />
-            <ReferenceLine y={bdpMss}  stroke={P.accent} strokeDasharray="4 3"
+            <ReferenceLine y={bdpMss}   stroke={P.accent} strokeDasharray="4 3"
               label={{value:"BDP", fill:P.accent, fontSize:10, position:"insideTopRight"}} />
-            <ReferenceLine y={maxCwnd} stroke={P.red}    strokeDasharray="2 4"
+            <ReferenceLine y={bufLimit} stroke={P.red}    strokeDasharray="2 4"
               label={{value:"buffer limit", fill:P.red, fontSize:10, position:"insideTopRight"}} />
             <Legend wrapperStyle={{fontSize:"0.78em", paddingTop:4}} />
-            <Line type="monotone" dataKey="cwnd_cubic" name="CUBIC"
+            <Line type="monotone" dataKey="cwnd_comp"  name={algo.name}
+              dot={false} strokeWidth={2} stroke={algo.color} />
+            <Line type="monotone" dataKey="cwnd_cubic" name="Cubic (default)"
               dot={false} strokeWidth={2} stroke={P.red} />
-            <Line type="monotone" dataKey="cwnd_bbr"   name="BBR"
-              dot={false} strokeWidth={2} stroke={P.green} />
-            <Line type="monotone" dataKey="loss_cubic" name="CUBIC loss"
-              dot={{r:4, fill:P.red, stroke:"#fff", strokeWidth:1}}
+            <Line type="monotone" dataKey="loss_cubic" name="Cubic loss"
+              dot={{r:3.5, fill:P.red, stroke:"#fff", strokeWidth:1}}
               activeDot={false} stroke="none" legendType="circle" />
           </LineChart>
         </ResponsiveContainer>
       </div>
 
-      {/* Chart 2: RTT */}
+      {/* Chart 2: shared path RTT */}
       <div style={{background:P.panel, border:`1px solid ${P.border}`, borderRadius:10,
         padding:"18px 16px", margin:"12px 0"}}>
-        <ChartHeader title="Observed RTT — ms" logY={logRtt2} setLogY={setLogRtt2} />
+        <ChartHeader title="Path RTT — ms (shared bottleneck)" logY={logRtt2} setLogY={setLogRtt2} />
         <div style={{color:P.muted, fontSize:"0.79em", marginBottom:10, lineHeight:1.6}}>
-          CUBIC fills the switch buffer before backing off — queuing delay inflates RTT well
-          above the propagation baseline. BBR continuously tracks RTprop (minimum RTT) and
-          avoids building a queue, keeping latency near the wire delay.
+          Both flows traverse the same queue, so they observe the same RTT. Loss-based and
+          utility flows that fill the buffer inflate this well above RTprop; latency-aware
+          flows (PCC) and zero-queue models keep it near the propagation baseline.
         </div>
-        <ResponsiveContainer width="100%" height={200}>
+        <ResponsiveContainer width="100%" height={190}>
           <LineChart data={rows} margin={{top:4,right:24,bottom:20,left:10}}>
             {grid}{xAx}
             <YAxis {...yAxisProps(logRtt2, 0.1, "RTT (ms)", {tick:{fontSize:10}, label:{...yAxisProps(logRtt2,0.1,"RTT (ms)").label, fontSize:10, dx:-6}})} />
@@ -292,55 +364,47 @@ function BbrComparison() {
             <ReferenceLine y={rtt} stroke={P.accent} strokeDasharray="4 3"
               label={{value:"RTprop", fill:P.accent, fontSize:10, position:"insideTopRight"}} />
             <Legend wrapperStyle={{fontSize:"0.78em", paddingTop:4}} />
-            <Line type="monotone" dataKey="rtt_cubic" name="CUBIC RTT"
-              dot={false} strokeWidth={2} stroke={P.red} />
-            <Line type="monotone" dataKey="rtt_bbr"   name="BBR RTT"
-              dot={false} strokeWidth={2} stroke={P.green} />
+            <Line type="monotone" dataKey="rtt" name="Path RTT"
+              dot={false} strokeWidth={2} stroke={P.cyan} />
           </LineChart>
         </ResponsiveContainer>
       </div>
 
-      {/* Chart 3: Queue depth */}
+      {/* Chart 3: shared queue depth */}
       <div style={{background:P.panel, border:`1px solid ${P.border}`, borderRadius:10,
         padding:"18px 16px", margin:"12px 0"}}>
-        <ChartHeader title="Switch buffer queue depth — MSS" logY={logQueue} setLogY={setLogQueue} />
+        <ChartHeader title="Bottleneck queue depth — MSS" logY={logQueue} setLogY={setLogQueue} />
         <div style={{color:P.muted, fontSize:"0.79em", marginBottom:10, lineHeight:1.6}}>
-          CUBIC persistently fills the buffer — this is bufferbloat and raises latency for
-          every flow sharing that port. BBR targets zero queue in steady state; a brief spike
-          appears only during the bandwidth probe phase (1 RTT every 8 RTTs).
+          The shared queue is the contended resource. A flow that keeps it full claims more
+          bandwidth but punishes latency for everyone; a flow that drains it sacrifices
+          throughput when competing against a buffer-filling neighbour.
         </div>
-        <ResponsiveContainer width="100%" height={190}>
+        <ResponsiveContainer width="100%" height={180}>
           <AreaChart data={rows} margin={{top:4,right:24,bottom:20,left:10}}>
             {grid}{xAx}
             <YAxis {...yAxisProps(logQueue, 0.1, "Queue (MSS)", {tick:{fontSize:10}, label:{...yAxisProps(logQueue,0.1,"Queue (MSS)").label, fontSize:10, dx:-6}})} />
             <Tooltip contentStyle={tipStyle} formatter={(v,n)=>[`${v} MSS`, n]} />
             <defs>
-              <linearGradient id="qc" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="5%"  stopColor={P.red}   stopOpacity={0.3}/>
-                <stop offset="95%" stopColor={P.red}   stopOpacity={0}/>
-              </linearGradient>
-              <linearGradient id="qb" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="5%"  stopColor={P.green} stopOpacity={0.3}/>
-                <stop offset="95%" stopColor={P.green} stopOpacity={0}/>
+              <linearGradient id="qshared" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="5%"  stopColor={P.yellow} stopOpacity={0.3}/>
+                <stop offset="95%" stopColor={P.yellow} stopOpacity={0}/>
               </linearGradient>
             </defs>
             <Legend wrapperStyle={{fontSize:"0.78em", paddingTop:4}} />
-            <Area type="monotone" dataKey="queue_cubic" name="CUBIC queue"
-              stroke={P.red}   fill="url(#qc)" strokeWidth={1.5} />
-            <Area type="monotone" dataKey="queue_bbr"   name="BBR queue"
-              stroke={P.green} fill="url(#qb)" strokeWidth={1.5} />
+            <Area type="monotone" dataKey="queue" name="Shared queue"
+              stroke={P.yellow} fill="url(#qshared)" strokeWidth={1.5} />
           </AreaChart>
         </ResponsiveContainer>
       </div>
 
-      {/* Chart 4: Throughput */}
+      {/* Chart 4: Throughput split */}
       <div style={{background:P.panel, border:`1px solid ${P.border}`, borderRadius:10,
         padding:"18px 16px", margin:"12px 0"}}>
-        <ChartHeader title="Throughput — Mbps" logY={logTput} setLogY={setLogTput} />
+        <ChartHeader title="Throughput split — Mbps" logY={logTput} setLogY={setLogTput} />
         <div style={{color:P.muted, fontSize:"0.79em", marginBottom:10, lineHeight:1.6}}>
-          CUBIC throughput oscillates continuously — always either climbing toward the link
-          rate or recovering from loss. BBR maintains steady throughput near the link ceiling,
-          with only a brief dip during the RTT probe (~every 30 RTTs, 1 RTT duration).
+          The headline result: how the bottleneck splits between {algo.name} and the default
+          Cubic flow. The gap between the two lines is exactly what Jain&apos;s index above
+          quantifies.
         </div>
         <ResponsiveContainer width="100%" height={200}>
           <LineChart data={rows} margin={{top:4,right:24,bottom:20,left:10}}>
@@ -350,44 +414,59 @@ function BbrComparison() {
             <ReferenceLine y={bw} stroke={P.accent} strokeDasharray="4 3"
               label={{value:"link rate", fill:P.accent, fontSize:10, position:"insideTopRight"}} />
             <Legend wrapperStyle={{fontSize:"0.78em", paddingTop:4}} />
-            <Line type="monotone" dataKey="tput_cubic" name="CUBIC"
+            <Line type="monotone" dataKey="tput_comp"  name={algo.name}
+              dot={false} strokeWidth={2} stroke={algo.color} />
+            <Line type="monotone" dataKey="tput_cubic" name="Cubic (default)"
               dot={false} strokeWidth={2} stroke={P.red} />
-            <Line type="monotone" dataKey="tput_bbr"   name="BBR"
-              dot={false} strokeWidth={2} stroke={P.green} />
           </LineChart>
         </ResponsiveContainer>
       </div>
 
-      {/* Behaviour table */}
-      <div style={{overflowX:"auto", margin:"8px 0 24px"}}>
+      {/* Hybla growth equations */}
+      <div style={{color:P.muted, fontSize:"0.82em", lineHeight:1.6, margin:"4px 0 6px"}}>
+        Hybla erases TCP&apos;s bias against high-RTT flows by scaling its growth with
+        ρ = RTT / RTT₀ (RTT₀ ≈ 25 ms wired reference). Per round trip:
+      </div>
+      <Formula>SS: cwnd ×= 2<sup>ρ</sup>&nbsp;&nbsp;&nbsp;CA: cwnd += ρ²&nbsp;&nbsp;&nbsp;ρ = RTT / RTT₀</Formula>
+
+      {/* Measured results from the paper */}
+      <div style={{margin:"18px 0 6px", color:P.text, fontWeight:700, fontSize:"0.95em"}}>
+        Measured results — Zhao, Peters, Chung &amp; Claypool (2022), IEEE CCNC
+      </div>
+      <div style={{color:P.muted, fontSize:"0.8em", marginBottom:10, lineHeight:1.55}}>
+        Ground-truth measurements over a commercial Viasat-2 link (~140 Mb/s, RTT ≈ 600 ms).
+        Jain&apos;s index per phase, plus the overall throughput difference vs Cubic
+        (+ = Cubic gets more, − = the competitor gets more). The selected row is highlighted.
+      </div>
+      <div style={{overflowX:"auto", margin:"0 0 24px"}}>
         <table style={{width:"100%", borderCollapse:"collapse", fontSize:"0.83em"}}>
           <thead>
             <tr style={{borderBottom:`2px solid ${P.border}`}}>
-              {["Property","CUBIC (default)","BBR","Why it matters"].map(h=>(
+              {["Algorithm","Jain start-up","Jain steady","Jain overall","Δ throughput (Mb/s)","Competing with Cubic"].map(h=>(
                 <th key={h} style={{padding:"8px 10px", textAlign:"left", color:P.muted,
                   fontWeight:600, letterSpacing:"0.03em"}}>{h}</th>
               ))}
             </tr>
           </thead>
           <tbody>
-            {[
-              ["Congestion signal",   "Packet loss — must overflow buffer",   "BtlBw + RTprop model",          "BBR never waits for a drop"],
-              ["Window behaviour",    "Sawtooth — grow, drop, repeat",        "Steady at BDP; brief probes",   "More predictable throughput"],
-              ["Queue depth",         "Fills buffer (bufferbloat)",            "Near zero in steady state",     "Lower latency for all flows on switch"],
-              ["RTT inflation",       "Up to 2–3× propagation delay",         "Tracks propagation delay",      "More accurate timeout calculation"],
-              ["Loss event required", `Yes — ${lossEvents} in simulation`,    "No",                            "BBR works well on lossy links"],
-              ["fq qdisc",           "Not required",                          "Mandatory (pacing)",            "Must set default_qdisc=fq with BBR"],
-              ["High BDP paths",      "Under-utilises (window takes time)",   "Self-calibrates immediately",   "No manual rmem tuning required"],
-              ["After restart/idle",  "Slow convergence (sawtooth)",          "Re-locks to BDP quickly",       "Faster post-failure recovery"],
-            ].map(([prop,cubic,bbr,why],i)=>(
-              <tr key={prop} style={{borderBottom:`1px solid ${P.border}`,
-                background: i%2===0 ? "transparent" : "#161b22"}}>
-                <td style={{padding:"7px 10px", color:P.text,   fontWeight:600}}>{prop}</td>
-                <td style={{padding:"7px 10px", color:P.red                   }}>{cubic}</td>
-                <td style={{padding:"7px 10px", color:P.green                 }}>{bbr}</td>
-                <td style={{padding:"7px 10px", color:P.muted,  fontSize:"0.9em"}}>{why}</td>
-              </tr>
-            ))}
+            {Object.entries(ALGOS).map(([id,a])=>{
+              const sel = id===competitor;
+              return (
+                <tr key={id} style={{borderBottom:`1px solid ${P.border}`,
+                  background: sel ? a.color+"18" : "transparent"}}>
+                  <td style={{padding:"7px 10px", color:a.color, fontWeight:700}}>{a.name}</td>
+                  {a.fair.map((f,i)=>(
+                    <td key={i} style={{padding:"7px 10px", color:fairColor(f),
+                      fontFamily:"monospace"}}>{f.toFixed(2)}</td>
+                  ))}
+                  <td style={{padding:"7px 10px", fontFamily:"monospace",
+                    color: a.diff>=0 ? P.accent : a.color}}>
+                    {a.diff>=0?"+":""}{a.diff.toFixed(1)}
+                  </td>
+                  <td style={{padding:"7px 10px", color:P.muted, fontSize:"0.92em"}}>{a.note}</td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>
@@ -1300,21 +1379,24 @@ export default function App() {
         );
       })()}
 
-      {/* ── 8. BBR vs CUBIC ──────────────────────────────────────────────── */}
-      <SectionHeading num="8" title="BBR vs CUBIC — Congestion Control Comparison" />
+      {/* ── 8. Competing Congestion Control ──────────────────────────────── */}
+      <SectionHeading num="8" title="Competing Congestion Control Algorithms" />
 
       <p style={{color:P.muted, lineHeight:1.7, fontSize:"0.93em"}}>
-        CUBIC (the Linux default) uses <strong style={{color:P.text}}>packet loss</strong> as
-        its congestion signal — it must overflow the switch buffer before it knows it has sent
-        too fast. This produces the characteristic sawtooth window pattern and inflates RTT for
-        every flow sharing that buffer.{" "}
-        <strong style={{color:P.text}}>BBR</strong> (Cardwell et al., 2016) instead continuously
-        estimates <Mono>BtlBw</Mono> (bottleneck bandwidth) and <Mono>RTprop</Mono>{" "}
-        (propagation delay), targeting exactly BDP bytes in flight — no queue, no loss required.
-        Adjust the sliders to see how path parameters change the behaviour.
+        Real links carry many flows at once, and a new algorithm only matters by how it behaves
+        when it shares a bottleneck with the deployed default —{" "}
+        <strong style={{color:P.text}}>Cubic</strong>. Following Zhao, Peters, Chung &amp; Claypool
+        (2022), this simulation pits one competitor against a default Cubic flow over a single
+        shared bottleneck and measures the split with Jain&apos;s fairness index. Four approaches:
+        loss-based <strong style={{color:P.text}}>Cubic</strong>, bandwidth-estimation{" "}
+        <strong style={{color:P.text}}>BBR</strong> (Cardwell et al., 2016), utility-function{" "}
+        <strong style={{color:P.text}}>PCC</strong> (Dong et al., 2018), and satellite-optimised{" "}
+        <strong style={{color:P.text}}>Hybla</strong> (Caini &amp; Firrincieli, 2004). Pick a
+        competitor and adjust the path — the default values reproduce the paper&apos;s Viasat-2
+        satellite testbed.
       </p>
 
-      <BbrComparison />
+      <CongestionCompetition />
 
       {/* ── 9. References ────────────────────────────────────────────────── */}
       <SectionHeading num="9" title="References & Standards" />
@@ -1351,6 +1433,14 @@ export default function App() {
            url:"https://www.rfc-editor.org/rfc/rfc7323"},
           {tag:"BBR 2016",     year:2016, title:"BBR: Congestion-Based Congestion Control — Cardwell, Cheng, Gunn, Yeganeh, Jacobson; ACM Queue 14(5)",
            url:"https://queue.acm.org/detail.cfm?id=3022184"},
+          {tag:"Hybla 2004",   year:2004, title:"TCP Hybla: a TCP Enhancement for Heterogeneous Networks — Caini & Firrincieli; Int. J. Satellite Comms & Networking 22(5)",
+           url:"https://doi.org/10.1002/sat.799"},
+          {tag:"PCC 2015",     year:2015, title:"PCC: Re-architecting Congestion Control for Consistent High Performance — Dong, Li, Zarchy, Godfrey, Schapira; USENIX NSDI",
+           url:"https://www.usenix.org/conference/nsdi15/technical-sessions/presentation/dong"},
+          {tag:"PCC Vivace 2018",year:2018, title:"PCC Vivace: Online-Learning Congestion Control — Dong, Meng, Zarchy, Arslan, Gilad, Godfrey, Schapira; USENIX NSDI",
+           url:"https://www.usenix.org/conference/nsdi18/presentation/dong"},
+          {tag:"Zhao 2022",    year:2022, title:"Competing TCP Congestion Control Algorithms over a Satellite Network — Zhao, Peters, Chung, Claypool; IEEE CCNC",
+           url:"https://web.cs.wpi.edu/~claypool/papers/tcp-compete-22/"},
         ].map(({tag,year,title,url}) => (
           <a key={tag} href={url} target="_blank" rel="noreferrer"
             style={{display:"flex", alignItems:"center", gap:12, background:P.panel,

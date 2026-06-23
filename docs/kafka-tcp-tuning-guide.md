@@ -135,6 +135,45 @@ BBR thus implements F2 as a real-time control law, targeting exactly the BDP wit
 > BBR requires net.core.default_qdisc = fq to function correctly. The default Linux scheduler pfifo_fast does not support per-flow pacing. Setting tcp_congestion_control = bbr without the corresponding fq qdisc degrades BBR to approximately CUBIC behaviour and eliminates its latency advantages.
 
 
+## 2.6  Competing congestion control algorithms
+
+A congestion control algorithm is never evaluated in isolation in production: links carry many concurrent flows, and what matters is how a candidate algorithm shares the bottleneck with the deployed default, CUBIC. Zhao, Peters, Chung & Claypool \[17\] measured exactly this over a commercial Viasat-2 satellite link (peak ≈ 140 Mb/s, RTT ≈ 600 ms, BDP ≈ 10.5 MB), running a single competing flow against a default CUBIC flow and quantifying the split with Jain's fairness index. They compare four approaches:
+
+- **CUBIC** \[18\] — loss-based AIMD; the Linux default since kernel 2.6.19. Window growth follows a cubic function of time since the last loss event; congestion is inferred only from packet loss (buffer overflow).
+
+- **BBR** \[4\] — bandwidth-estimation based. Targets BtlBw × RTprop = BDP and **disregards packet loss as a congestion signal**. Because it does not yield to loss, a BBR flow ratchets its window up while a competing CUBIC flow repeatedly halves on each drop — so BBR dominates CUBIC in both start-up and steady state.
+
+- **PCC (Vivace-Latency)** \[19\] — utility-function based. PCC runs continuous micro-experiments and adopts the sending rate that maximises a utility function; the Vivace-Latency variant penalises rising delay. It therefore **reduces its rate whenever the queue builds**, ceding bandwidth to CUBIC, which fills the buffer until loss. The result is that CUBIC dominates PCC in steady state.
+
+- **Hybla** \[20\] — satellite-optimised. Hybla erases TCP's structural bias against high-RTT flows by scaling window growth with the normalised round-trip time ρ = RTT / RTT₀, where RTT₀ ≈ 25 ms is a reference "wired" RTT. Per round trip its growth rules become:
+
+```
+Slow start:          cwnd ← cwnd × 2^ρ
+Congestion avoidance: cwnd ← cwnd + ρ²
+```
+
+(equivalently, the per-ACK increments cwnd += 2^ρ − 1 and cwnd += ρ²/cwnd of \[20\]). At ρ = 1 this reduces to standard TCP; on a satellite path (ρ ≈ 24) the slow-start multiplier fills the pipe almost instantly. Consequently Hybla dominates the **start-up** phase but, being loss-based thereafter, shares fairly with CUBIC in steady state.
+
+Jain's fairness index for two flows is:
+
+```
+f(x₁, x₂) = (x₁ + x₂)² / [2 × (x₁² + x₂²)]          (F21)
+```
+
+ranging from ½ (one flow starves the other) to 1 (equal shares). Table 1a reproduces the measured results from \[17, Fig. 7\], reporting fairness separately for start-up (first 15 s), steady state (final 60 s), and overall, alongside the overall throughput difference relative to CUBIC.
+
+**Table 1a.** *Measured fairness and throughput difference vs CUBIC over the Viasat-2 link \[17\]. Positive Δ = CUBIC receives more; negative = the competitor receives more.*
+
+| Competitor | Jain (start-up) | Jain (steady) | Jain (overall) | Δ throughput (Mb/s) | Behaviour vs CUBIC                         |
+|------------|-----------------|---------------|----------------|---------------------|--------------------------------------------|
+| CUBIC      | 1.00            | 0.99          | 0.99           | +7.3                | Fair to another CUBIC flow in all phases   |
+| BBR        | 0.93            | 0.53          | 0.55           | −91.6               | Dominates CUBIC in both phases             |
+| PCC        | 0.98            | 0.85          | 0.85           | +44.0               | CUBIC dominates PCC in steady state        |
+| Hybla      | 0.51            | 0.99          | 0.92           | −33.2               | Dominates start-up, fair in steady state   |
+
+The practical lesson for Kafka operators: an algorithm that is faster in isolation may be either a bully (BBR) or a pushover (PCC) when sharing a link, and the right choice depends on the path. On long-fat or satellite links, Hybla's RTT compensation gives it a strong, fair start-up; BBR maximises a single flow's throughput on lossy paths but is aggressive toward co-located loss-based flows; PCC's latency sensitivity can leave it starved against buffer-filling neighbours. The interactive dashboards reproduce these dynamics — selecting a competitor runs the same shared-bottleneck simulation and computes F21 per phase.
+
+
 # 3.  Formula Summary
 
 Table 2 consolidates all formulae referenced in this document, with their primary sources. F1 is the master relation; all others are either derivations of F1 or describe conditions under which F1 cannot be maintained.
@@ -164,6 +203,9 @@ Table 2 consolidates all formulae referenced in this document, with their primar
 | **F18** | **Replication amplification**  | write_amplification = 1 + (RF−1)          | Leader node bandwidth multiplier    |
 | **F19** | **Per-broker bandwidth budget**| producer + consumer + repl_in + repl_out  | NIC saturation constraint (cloud)   |
 | **F20** | **Effective MSS in hybrid paths** | MSS_eff = min(MTU_vpc, MTU_internet) − 40 | Cloud egress constraint             |
+| **F21** | **Jain's fairness index**      | f = (Σxᵢ)² / (n × Σxᵢ²)                    | Jain (1984); applied in \[17\]      |
+| **H1**  | **Hybla slow start**           | cwnd ← cwnd × 2^ρ, ρ = RTT/RTT₀           | Caini & Firrincieli \[20\]          |
+| **H2**  | **Hybla congestion avoidance** | cwnd ← cwnd + ρ²                          | Caini & Firrincieli \[20\]          |
 
 # 4.  Layer Overhead Analysis
 
@@ -1049,6 +1091,14 @@ Reads the output of kafka-tcp-measure.sh, applies the calculations from Section 
 **\[15\]** Apache Software Foundation. (2024). Apache Kafka Documentation: Producer Configurations. https://kafka.apache.org/documentation/#producerconfigs
 
 **\[16\]** Shannon, C.E. (1948). A mathematical theory of communication. Bell System Technical Journal, 27(3), 379–423.
+
+**\[17\]** Zhao, P., Peters, B., Chung, J.W., & Claypool, M. (2022). Competing TCP congestion control algorithms over a satellite network. Proceedings of the IEEE Consumer Communications & Networking Conference (CCNC).
+
+**\[18\]** Ha, S., Rhee, I., & Xu, L. (2008). CUBIC: a new TCP-friendly high-speed TCP variant. ACM SIGOPS Operating Systems Review, 42(5), 64–74.
+
+**\[19\]** Dong, M., Meng, T., Zarchy, D., Arslan, E., Gilad, Y., Godfrey, B., & Schapira, M. (2018). PCC Vivace: online-learning congestion control. Proceedings of the 15th USENIX Symposium on Networked Systems Design and Implementation (NSDI).
+
+**\[20\]** Caini, C., & Firrincieli, R. (2004). TCP Hybla: a TCP enhancement for heterogeneous networks. International Journal of Satellite Communications and Networking, 22(5), 547–566.
 
 
 > **Formula chain**
